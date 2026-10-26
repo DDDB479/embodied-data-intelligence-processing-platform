@@ -51,6 +51,13 @@ test('HTTP API rejects fabricated QC and completion state', async () => {
     assert.equal(setup.status, 201);
     const cookie = setup.headers['set-cookie'][0].split(';')[0];
 
+    const capabilities = await request(port, 'GET', '/api/engine/capabilities', null, cookie);
+    assert.equal(capabilities.status, 200);
+    assert.equal(capabilities.body.engine, 'evidence-v3-embodied');
+    assert.deepEqual(capabilities.body.operators.map(operator => operator.id), ['sync', 'clean', 'compliance', 'perception', 'label', 'export']);
+    assert.ok(['optional', 'available'].includes(capabilities.body.operators.find(operator => operator.id === 'perception').status));
+    assert.deepEqual(capabilities.body.workflowStages.map(stage => stage.id), ['import', 'clean', 'select', 'annotate', 'review', 'quality', 'convert', 'deliver']);
+
     const asset = await request(port, 'POST', '/api/assets', { id: 'AST-QA-1', name: 'episode_000000.parquet', type: '遥操', status: '已通过', score: 100, lastQcAt: '2099-01-01' }, cookie);
     assert.equal(asset.status, 201);
     assert.equal(asset.body.asset.status, '待质检');

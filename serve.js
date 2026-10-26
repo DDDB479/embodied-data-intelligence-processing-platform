@@ -22,6 +22,24 @@ const authFile = path.join(workDir, "auth.json");
 const MAX_UPLOAD = 20 * 1024 * 1024 * 1024;
 const SAMPLE_LIMIT = 5 * 1024 * 1024;
 const DATA_TYPES = ["UMI", "EGO", "遥操"];
+const WORKFLOW_STAGES = [
+  { id: "import", name: "上传 / 导入", description: "登记数据包、识别 meta / trajectory / media 并写入服务端" },
+  { id: "clean", name: "数据清洗", description: "执行只读结构、文件签名和存储一致性检查" },
+  { id: "select", name: "数据筛选", description: "按数据类型、场景和质量门禁筛选可用 Episode" },
+  { id: "annotate", name: "数据标注", description: "维护 Episode 标注并保留版本与审核状态" },
+  { id: "review", name: "标注审核", description: "复核标注完整性和关键字段，形成审核证据" },
+  { id: "quality", name: "数据质检", description: "运行规则、LeRobot schema 和媒体一致性检查" },
+  { id: "convert", name: "格式转换", description: "在记录转换结果和输入指纹后生成交付格式" },
+  { id: "deliver", name: "打包交付", description: "仅对通过验收门禁的数据生成 Manifest 和清单" },
+];
+const ENGINE_OPERATORS = [
+  { id: "sync", name: "数据同步", stage: "上传 / 导入", mode: "server", description: "按总文件夹结构登记 meta、trajectory、media，并将原始文件写入服务端存储。", capabilities: ["folder-import", "stream-upload", "sha256"] },
+  { id: "clean", name: "基础清洗", stage: "导入后核验", mode: "server", description: "只读检查文件签名、结构和可读取性，不静默修改原始数据。", capabilities: ["signature", "schema", "storage-reconcile"] },
+  { id: "compliance", name: "质量合规", stage: "数据质检", mode: "server", description: "执行服务端规则、LeRobot schema 检查和问题证据归档。", capabilities: ["rules", "lerobot-schema", "issue-evidence"] },
+  { id: "perception", name: "感知检查", stage: "视频 / 图像", mode: "optional-plugin", description: "通过 Embodied Data 插件执行 detect、info、validate、quality。", capabilities: ["embodied-detect", "embodied-info", "embodied-validate", "embodied-quality"] },
+  { id: "label", name: "标注审核", stage: "标注 / 复核", mode: "server", description: "维护 Episode 标注、审核状态和交付门禁。", capabilities: ["episode-annotation", "review-gate"] },
+  { id: "export", name: "交付清单", stage: "验收 / 交付", mode: "server", description: "按质量门禁生成原始文件清单、Manifest 和 annotations JSONL。", capabilities: ["manifest", "sha256", "delivery-gate"] },
+];
 const DEEP_FORMATS = ["HDF5", "H5", "MCAP", "PARQUET", "ZIP", "LEROBOT"];
 const VIDEO_FORMATS = ["MP4", "MOV", "WEBM", "AVI"];
 const loginFailures = new Map();
@@ -106,6 +124,14 @@ function findEmbodiedInvocation() {
     return { command: python, prefix: ["-m", "embodied_core.cli"], env };
   }
   return null;
+}
+
+function engineOperatorCatalog(plugin = findEmbodiedInvocation()) {
+  return ENGINE_OPERATORS.map(operator => ({
+    ...operator,
+    status: operator.mode === "optional-plugin" ? (plugin ? "available" : "optional") : "available",
+    availability: operator.mode === "optional-plugin" ? (plugin ? "服务端已连接 Embodied Data 插件" : "未配置外部插件，执行时会明确返回不可用") : "服务端已启用",
+  }));
 }
 
 async function runEmbodiedCommand(args, timeout = 180000) {
@@ -367,6 +393,7 @@ function hasPermission(user, required = [], auth = null) {
 }
 function readPermissionFor(pathname) {
   const rules = [
+    [/^\/api\/engine\/capabilities$/, ["资产查看", "运行质检"]],
     [/^\/api\/bundles(?:\/|$)/, ["资产查看", "资产管理"]],
     [/^\/api\/assets(?:\/|$)/, ["资产查看", "资产上传", "资产管理"]], [/^\/api\/tasks(?:\/|$)/, ["采集任务"]],
     [/^\/api\/issues$/, ["问题查看", "问题处置"]], [/^\/api\/annotations$/, ["标注查看", "标注审核"]],
@@ -965,6 +992,19 @@ async function handleApi(req, res, pathname, url) {
   }
   if (req.method === "GET") { const required = readPermissionFor(pathname); if (required && !hasPermission(currentUser, required)) { sendError(res, 403, `当前角色无权读取：${required.join(" 或 ")}`, { required }); return true; } }
   const visible = scopedState(state, currentUser);
+  if (req.method === "GET" && pathname === "/api/engine/capabilities") {
+    const plugin = findEmbodiedInvocation();
+    sendJson(res, 200, {
+      ok: true,
+      engine: "evidence-v3-embodied",
+      version: "1.0",
+      operators: engineOperatorCatalog(plugin),
+      workflowStages: WORKFLOW_STAGES,
+      plugin: { configured: Boolean(plugin), source: plugin ? (plugin.prefix?.join(" ") || plugin.command) : null },
+      evidencePolicy: "每次质检和交付都记录输入指纹、规则快照、问题证据和产物哈希；未满足门禁时不生成可交付结果。",
+    });
+    return true;
+  }
   if (req.method === "GET" && pathname === "/api/state") { sendJson(res, 200, { ok: true, ...visible, rolePolicies: ROLE_POLICIES, authMode: "local", currentUser: publicUser(currentUser), accessScope: { role: currentUser.role, domain: currentUser.domain } }); return true; }
   const bundleReportRoute = /^\/api\/bundles\/([^/]+)\/report$/.exec(pathname);
   if (req.method === "GET" && bundleReportRoute) {
@@ -1343,7 +1383,8 @@ const server = http.createServer(async (req, res) => {
   if (pathname === "/health") {
     ensureStorage();
     const state = readState(), auth = readAuth(), productionAssets = state.assets.filter(item => !item.isDemo), productionIds = new Set(productionAssets.map(item => item.id)), gate = exportGate(state), nodes = state.nodes.map(deriveNodeStatus), bundles = bundleList(state), bundlePending = bundles.filter(item => ["可提交验收", "待验收"].includes(item.status)).length, bundleAccepted = bundles.filter(item => item.status === "已验收").length;
-    sendJson(res, 200, { ok: true, service: "embodied-data-quality", version: "2.10.0", port, storage: "server", uploadMode: "stream", importRollback: "enabled", storageReconcile: "enabled", qcEngine: "evidence-v3-embodied", embodiedPlugin: findEmbodiedInvocation() ? "available" : "missing", issueClosure: "server-evidence-required", productionWorkflow: "task-asset-acceptance", authMode: "local", accessControl: "role-domain-and-owner-grants", setupRequired: auth.users.length === 0, accounts: auth.users.length, assets: productionAssets.length, demoAssets: state.assets.length - productionAssets.length, tasks: state.tasks.length, tasksPendingAcceptance: state.tasks.filter(item => item.status === "待验收").length, bundles: bundles.length, bundlesPendingAcceptance: bundlePending, bundlesAccepted: bundleAccepted, annotations: state.annotations.filter(item => !item.assetId || productionIds.has(item.assetId)).length, exports: state.exports.length, datasets: state.datasets.length, trainingJobs: state.trainingJobs.length, feedbackSamples: state.feedbackSamples.reduce((sum, item) => sum + Number(item.count || 0), 0), nodes: nodes.length, nodesOnline: nodes.filter(item => item.status === "在线").length, members: state.members.length, exportEligible: gate.eligible.length, issuesOpen: state.issues.filter(item => item.status !== "已关闭" && (!item.assetId || productionIds.has(item.assetId))).length, rulesEnabled: state.rules.filter(item => item.enabled !== false).length });
+    const embodiedPlugin = findEmbodiedInvocation();
+    sendJson(res, 200, { ok: true, service: "embodied-data-quality", version: "2.10.0", port, storage: "server", uploadMode: "stream", importRollback: "enabled", storageReconcile: "enabled", qcEngine: "evidence-v3-embodied", embodiedPlugin: embodiedPlugin ? "available" : "missing", engineOperators: engineOperatorCatalog(embodiedPlugin).map(item => ({ id: item.id, status: item.status })), workflowStages: WORKFLOW_STAGES.map(item => item.id), issueClosure: "server-evidence-required", productionWorkflow: "task-asset-acceptance", authMode: "local", accessControl: "role-domain-and-owner-grants", setupRequired: auth.users.length === 0, accounts: auth.users.length, assets: productionAssets.length, demoAssets: state.assets.length - productionAssets.length, tasks: state.tasks.length, tasksPendingAcceptance: state.tasks.filter(item => item.status === "待验收").length, bundles: bundles.length, bundlesPendingAcceptance: bundlePending, bundlesAccepted: bundleAccepted, annotations: state.annotations.filter(item => !item.assetId || productionIds.has(item.assetId)).length, exports: state.exports.length, datasets: state.datasets.length, trainingJobs: state.trainingJobs.length, feedbackSamples: state.feedbackSamples.reduce((sum, item) => sum + Number(item.count || 0), 0), nodes: nodes.length, nodesOnline: nodes.filter(item => item.status === "在线").length, members: state.members.length, exportEligible: gate.eligible.length, issuesOpen: state.issues.filter(item => item.status !== "已关闭" && (!item.assetId || productionIds.has(item.assetId))).length, rulesEnabled: state.rules.filter(item => item.enabled !== false).length });
     return;
   }
   if (await handleApi(req, res, pathname, url)) return;
