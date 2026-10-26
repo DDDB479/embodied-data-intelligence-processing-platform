@@ -1,7 +1,8 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $work = Join-Path $root "work"
-$node = Join-Path $root "runtime\node.exe"
+$bundledNode = Join-Path $root "runtime\node.exe"
+$node = if (Test-Path -LiteralPath $bundledNode) { $bundledNode } else { (Get-Command node.exe -ErrorAction SilentlyContinue).Source }
 $server = Join-Path $root "serve.js"
 $stdout = Join-Path $work "service.log"
 $stderr = Join-Path $work "service.err.log"
@@ -9,8 +10,8 @@ $healthUrl = "http://127.0.0.1:4173/health"
 
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
-if (-not (Test-Path -LiteralPath $node)) {
-  "$(Get-Date -Format s) Missing runtime: $node" | Out-File $stderr -Append -Encoding utf8
+if (-not $node -or -not (Test-Path -LiteralPath $node)) {
+  "$(Get-Date -Format s) Node.js runtime is missing. Install Node.js 18+ or provide runtime\node.exe" | Out-File $stderr -Append -Encoding utf8
   exit 2
 }
 

@@ -28,14 +28,21 @@ function Test-PlatformHealth {
   }
 }
 
-if (-not (Test-Path -LiteralPath $runtime)) {
-  throw "Platform runtime is missing: $runtime"
+if (-not (Test-Path -LiteralPath $runtime) -and -not (Get-Command node.exe -ErrorAction SilentlyContinue)) {
+  throw "Node.js 18+ is required. Install Node.js or provide runtime\node.exe"
 }
 
 Clear-KnownPortConflict
 
 if (-not (Test-PlatformHealth)) {
-  Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+  $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  if ($task) {
+    Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+  } else {
+    $service = Join-Path $root "platform-service.ps1"
+    $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    Start-Process $powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',$service) -WorkingDirectory $root
+  }
   for ($attempt = 0; $attempt -lt 20; $attempt++) {
     Start-Sleep -Seconds 1
     if (Test-PlatformHealth) { break }
