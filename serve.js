@@ -1353,7 +1353,7 @@ const server = http.createServer(async (req, res) => {
 });
 server.listen(port, host, () => {
   const lan = Object.values(os.networkInterfaces()).flat().filter(item => item && item.family === "IPv4" && !item.internal).map(item => item.address);
-  console.log("========================================"); console.log("具身数据质量管控平台 v2.9 已启动  " + new Date().toLocaleString("zh-CN")); console.log("  本机访问：http://localhost:" + port); lan.forEach(address => console.log("  局域网访问：http://" + address + ":" + port)); console.log("  生产闭环：任务 → 资产 → 质检 → 验收"); console.log("  问题关闭：服务端证据复检"); console.log("  访问控制：角色权限 + 数据域隔离 + 所有者授权"); console.log("  流式上传目录：" + uploadDir); console.log("========================================");
+  console.log("========================================"); console.log("具身数据质量管控平台 v2.10 已启动  " + new Date().toLocaleString("zh-CN")); console.log("  本机访问：http://localhost:" + port); lan.forEach(address => console.log("  局域网访问：http://" + address + ":" + port)); console.log("  生产闭环：任务 → 资产 → 质检 → 验收"); console.log("  问题关闭：服务端证据复检"); console.log("  质量引擎：Embodied Data · LeRobot bundle check"); console.log("  访问控制：角色权限 + 数据域隔离 + 所有者授权"); console.log("  流式上传目录：" + uploadDir); console.log("========================================");
 });
 server.on("error", error => { console.error(error.code === "EADDRINUSE" ? `端口 ${port} 已被占用。` : "服务监听异常：" + error.message); process.exitCode = 1; });
 process.on("uncaughtException", error => console.error("服务异常：" + error.stack));
