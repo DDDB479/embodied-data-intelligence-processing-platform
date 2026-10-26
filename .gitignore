@@ -1,0 +1,16 @@
+# Local runtime and production data
+work/
+work-*/
+runtime/
+.codex/
+node_modules/
+
+# Logs and transient files
+*.log
+$null
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
