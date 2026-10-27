@@ -31,21 +31,38 @@ function Test-PlatformHealth {
 
 # The logon/daily task may run while the platform is already healthy. Reusing
 # that process avoids a false task failure caused by a second bind to port 4173.
-if (Test-PlatformHealth) { exit 0 }
-$listeners = @(Get-NetTCPConnection -LocalPort 4173 -State Listen -ErrorAction SilentlyContinue)
-if ($listeners.Count) {
-  foreach ($listener in $listeners) {
-    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)" -ErrorAction SilentlyContinue
-    if ($process -and $process.CommandLine -match "serve\.js") {
+# If the child exits later, keep the supervisor alive and restart it with a
+# bounded backoff instead of waiting for the next logon or daily trigger.
+$restartDelay = 2
+while ($true) {
+  if (Test-PlatformHealth) { exit 0 }
+
+  $listeners = @(Get-NetTCPConnection -LocalPort 4173 -State Listen -ErrorAction SilentlyContinue)
+  if ($listeners.Count) {
+    $owned = @()
+    $foreign = @()
+    foreach ($listener in $listeners) {
+      $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)" -ErrorAction SilentlyContinue
+      if ($process -and $process.CommandLine -and $process.CommandLine.Contains($server)) { $owned += $process } else { $foreign += $listener }
+    }
+    if ($foreign.Count) {
+      "$(Get-Date -Format s) Port 4173 is occupied by an unrelated process: $($foreign.OwningProcess -join ', ')" | Out-File $stderr -Append -Encoding utf8
+      exit 11
+    }
+    if ($owned.Count) {
       for ($attempt = 0; $attempt -lt 20; $attempt++) {
         Start-Sleep -Milliseconds 500
         if (Test-PlatformHealth) { exit 0 }
       }
+      foreach ($stale in $owned) { Stop-Process -Id $stale.ProcessId -Force -ErrorAction SilentlyContinue }
+      Start-Sleep -Milliseconds 500
     }
   }
-  "$(Get-Date -Format s) Port 4173 is occupied and the owner is not healthy: $($listeners.OwningProcess -join ', ')" | Out-File $stderr -Append -Encoding utf8
-  exit 11
-}
 
-& $node $server 1>> $stdout 2>> $stderr
-exit $LASTEXITCODE
+  & $node $server 1>> $stdout 2>> $stderr
+  $exitCode = $LASTEXITCODE
+  if (Test-PlatformHealth) { exit 0 }
+  "$(Get-Date -Format s) Platform process exited with code $exitCode; restarting in $restartDelay seconds." | Out-File $stderr -Append -Encoding utf8
+  Start-Sleep -Seconds $restartDelay
+  $restartDelay = [Math]::Min(30, $restartDelay + 2)
+}

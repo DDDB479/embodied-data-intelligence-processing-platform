@@ -36,16 +36,26 @@ Clear-KnownPortConflict
 
 if (-not (Test-PlatformHealth)) {
   $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  $service = Join-Path $root "platform-service.ps1"
+  $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
   if ($task) {
     Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
   } else {
-    $service = Join-Path $root "platform-service.ps1"
-    $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
     Start-Process $powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',$service) -WorkingDirectory $root
   }
   for ($attempt = 0; $attempt -lt 20; $attempt++) {
     Start-Sleep -Seconds 1
     if (Test-PlatformHealth) { break }
+  }
+  # A task can remain in Running state after its child process disappeared.
+  # Start one foreground supervisor as a fallback; it exits immediately when
+  # the task-managed service becomes healthy, so this does not create a second server.
+  if (-not (Test-PlatformHealth)) {
+    Start-Process $powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',$service) -WorkingDirectory $root
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+      Start-Sleep -Seconds 1
+      if (Test-PlatformHealth) { break }
+    }
   }
 }
 

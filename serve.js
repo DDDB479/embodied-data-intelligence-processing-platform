@@ -12,7 +12,10 @@ const execFileAsync = promisify(execFile);
 
 const root = __dirname;
 const port = Number(process.env.PORT || 4173);
-const host = process.env.HOST || "0.0.0.0";
+// Listen on IPv6 any-address with dual-stack enabled by default. Windows
+// commonly resolves `localhost` to ::1 first; an IPv4-only listener makes the
+// static page load inconsistently while /api/auth/status fails.
+const host = process.env.HOST || "::";
 const workDir = process.env.DATA_WORK_DIR ? path.resolve(process.env.DATA_WORK_DIR) : path.join(root, "work");
 const uploadDir = path.join(workDir, "uploads");
 const backupDir = path.join(workDir, "backups");
