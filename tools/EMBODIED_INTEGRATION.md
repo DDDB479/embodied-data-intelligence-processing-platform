@@ -23,3 +23,13 @@ $env:EMBODIED_PYTHON = 'D:\path\to\python.exe'
 `GET /api/engine/capabilities` 返回当前服务端真实能力，不把前端按钮当成能力声明。目录按上游 Embodied Data 的算子化思路拆分为 `sync`、`clean`、`compliance`、`perception`、`label`、`export` 六类，并标出每类的执行位置和状态。除 `perception` 外，基础能力均由本平台服务端执行；`perception` 只有在插件可被发现时才显示为可用，否则显示为可选插件，执行时返回明确错误。
 
 接口同时返回八个生产阶段：导入、清洗、筛选、标注、审核、质检、转换、交付。质检和交付结果必须带输入指纹、规则快照、问题证据及产物哈希，未满足门禁不会生成可交付结果。该集成借鉴上游项目的流程和算子边界，但保留本平台现有的真实文件存储、角色权限和验收门禁。
+
+## 数据接入工作台
+
+平台新增“数据接入”页面，用于承接采集控制台的入库视图。页面直接聚合服务端的 `bundles`、`assets`、Episode 轨迹、文件分组、原始文件大小、质检状态和未关闭问题，支持按数据包名称、类型、状态和 `meta / trajectory / media` 分组筛选。
+
+“导入总文件夹”复用现有导入向导；“打开生产批次”和“去质检”分别进入批次工作台与证据质检中心。页面不生成演示数据，刷新后仍以 `/api/state` 的真实状态重新渲染。
+
+## 任务级指令标注
+
+标注单位是采集任务或导入数据集，而不是单个 Episode。资产存在 `taskId` 时使用 `TASK:<taskId>` 归组，否则使用 `bundleId` 归组；每组只维护一条任务指令和一次审核状态，组内全部 Episode 自动继承。`/api/annotations/standard` 支持 `save`、`submit`、`approve`、`reject`、`reopen`，审核人不能修改已提交的指令。交付时服务端把同一指令展开到每个 Episode 的 `annotations.jsonl`，不再要求逐 Episode 填写执行结果或动作分段。

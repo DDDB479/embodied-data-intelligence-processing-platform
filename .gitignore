@@ -4,6 +4,8 @@ work-*/
 runtime/
 .codex/
 node_modules/
+__pycache__/
+*.pyc
 
 # Logs and transient files
 *.log
