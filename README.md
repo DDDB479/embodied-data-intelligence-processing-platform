@@ -51,7 +51,7 @@ flowchart LR
 
 | ① 数据接入 | ② 生产批次 · V6 |
 | --- | --- |
-| [![数据接入：按批次查看目录分组和入库规模](docs/screenshots/01-intake.jpg)](docs/screenshots/01-intake.jpg) | [![生产批次：V6 节点状态和当前门禁](docs/screenshots/02-production.jpg)](docs/screenshots/02-production.jpg) |
+| [![数据接入：按批次查看目录分组和入库规模](docs/screenshots/01-intake.jpg)](docs/screenshots/01-intake.jpg) | [![生产批次：V6 节点状态和当前门禁](docs/screenshots/02-production-preview.jpg)](docs/screenshots/02-production.jpg) |
 | 总文件夹导入入口、文件分组、Episode 数量与入库状态。 | 当前批次、问题阻断、验收入口与已接入 / 未接入节点。 |
 
 | ③ 质量检测中心 | ④ 问题中心 |
@@ -61,7 +61,7 @@ flowchart LR
 
 | ⑤ 任务指令标注与审核 | ⑥ 规则与质量门禁 |
 | --- | --- |
-| [![标注审核：任务指令审核一次并由 Episode 继承](docs/screenshots/05-annotation.jpg)](docs/screenshots/05-annotation.jpg) | [![规则中心：阈值、算子状态与规则列表](docs/screenshots/06-rules.jpg)](docs/screenshots/06-rules.jpg) |
+| [![标注审核：任务指令审核一次并由 Episode 继承](docs/screenshots/05-annotation.jpg)](docs/screenshots/05-annotation.jpg) | [![规则中心：阈值、算子状态与规则列表](docs/screenshots/06-rules-preview.jpg)](docs/screenshots/06-rules.jpg) |
 | 同一任务指令覆盖组内 Episode；审核时只读确认或退回。 | 查看评分阈值、启用规则和当前服务端能力。 |
 
 | ⑦ 格式转换与交付 | ⑧ 成员与权限 |
@@ -87,7 +87,7 @@ cd embodied-data-intelligence-processing-platform
 node .\serve.js
 ```
 
-浏览器打开 **http://localhost:4173/**，首次启动创建自己的管理员账号。仓库没有可用于业务登录的默认账号或默认密码。
+浏览器打开 [http://localhost:4173/](http://localhost:4173/)，首次启动创建自己的管理员账号。仓库没有可用于业务登录的默认账号或默认密码。
 
 日常使用可双击 `启动平台.bat`；启动器通过 `platform-service.ps1` 检查和维持本机服务。开机启动、局域网访问和故障定位见[操作说明](docs/OPERATIONS.md)。
 
