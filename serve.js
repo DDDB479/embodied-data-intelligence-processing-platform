@@ -11,6 +11,15 @@ const { pipeline } = require("stream/promises");
 const execFileAsync = promisify(execFile);
 
 const root = __dirname;
+const { PlatformStore } = require(path.join(root, 'tools', 'platform-store.cjs'));
+const { TaskQueue } = require(path.join(root, 'tools', 'task-queue.cjs'));
+const backupTools = require(path.join(root, 'tools', 'storage-backup.cjs'));
+const { ResumableUploads } = require(path.join(root, 'tools', 'resumable-upload.cjs'));
+let platformStore, taskQueue, resumableUploads, workLockOwned = false;
+function getStore() {
+  if (!platformStore) platformStore = new PlatformStore(workDir, { state: defaultState, auth: () => ({ sessionSecret: crypto.randomBytes(32).toString('base64url'), users: [], nodeCredentials: [] }) });
+  return platformStore;
+}
 const port = Number(process.env.PORT || 4173);
 // Listen on IPv6 any-address with dual-stack enabled by default. Windows
 // commonly resolves `localhost` to ::1 first; an IPv4-only listener makes the
@@ -424,10 +433,11 @@ function defaultRules() {
     { id: "RULE-TELE-CONTROL", code: "teleop_control", name: "遥操控制流关联", scope: "遥操", category: "同步性", threshold: "视频关联关节状态/控制指令流", severity: "中", enabled: true, system: true },
     { id: "RULE-UMI-TRAJECTORY", code: "umi_trajectory", name: "UMI 轨迹关联", scope: "UMI", category: "同步性", threshold: "视频关联 SLAM/末端轨迹", severity: "中", enabled: true, system: true },
     { id: "RULE-SEGMENT", code: "segment_completeness", name: "Episode 片段完整性", scope: "全部", category: "完整性", threshold: "轨迹与视频按 Episode / 相机逐项对应", severity: "高", enabled: true, locked: true, system: true },
+    { id: "RULE-PRODUCTION", code: "production_evidence", name: "服务端生产检查", scope: "全部", category: "可用性", threshold: "完整结构解析、轨迹数值和视频实际解码；检查证据绑定文件哈希", severity: "高", enabled: true, locked: true, system: true },
   ];
 }
 function defaultSettings() {
-  return { thresholds: { "快速质检": 85, "标准质检": 90, "全量质检": 93, "仅同步检测": 90 }, video: { minWidth: 640, minHeight: 480 }, issueWeights: { high: 35, medium: 8 } };
+  return { thresholds: { "快速质检": 85, "标准质检": 90, "全量质检": 93, "仅同步检测": 90 }, video: { minWidth: 640, minHeight: 480, blackMeanMax: 8, blackRatioMax: 0.95, freezeDifferenceMax: 0.15, freezeRatioMax: 0.98, durationToleranceSeconds: 0.1 }, issueWeights: { high: 35, medium: 8 } };
 }
 function defaultState() { return { assets: [], tasks: [], qcBatches: [], runs: [], audit: [], episodeTags: {}, issues: [], annotations: [], annotationStandards: {}, exports: [], datasets: [], trainingJobs: [], feedbackSamples: [], nodes: [], members: [], bundles: [], notificationsReadAt: null, rules: defaultRules(), settings: defaultSettings() }; }
 function ensureStorage() {
@@ -435,12 +445,22 @@ function ensureStorage() {
   fs.mkdirSync(backupDir, { recursive: true });
   fs.mkdirSync(exportDir, { recursive: true });
   fs.mkdirSync(deliveryDir, { recursive: true });
-  if (!fs.existsSync(stateFile)) writeState(defaultState());
-  if (!fs.existsSync(authFile)) writeAuth({ sessionSecret: crypto.randomBytes(32).toString("base64url"), users: [], nodeCredentials: [] });
+  const store = getStore();
+  if (!workLockOwned) {
+    store.db.exec('CREATE TABLE IF NOT EXISTS service_owner (id INTEGER PRIMARY KEY, pid INTEGER NOT NULL); BEGIN IMMEDIATE');
+    try {
+      const owner = store.db.prepare('SELECT pid FROM service_owner WHERE id=1').get();
+      let alive = false;
+      if (owner && owner.pid !== process.pid) { try { process.kill(owner.pid, 0); alive = true; } catch (error) { if (error.code !== 'ESRCH') alive = true; } }
+      if (alive) throw new Error(`该工作目录已由服务进程 ${owner.pid} 使用；禁止同时启动第二个任务执行器。`);
+      store.db.prepare('INSERT OR REPLACE INTO service_owner(id,pid) VALUES(1,?)').run(process.pid);
+      store.db.exec('COMMIT'); workLockOwned = true;
+    } catch (error) { store.db.exec('ROLLBACK'); throw error; }
+  }
 }
 function readState() {
-  try {
-    const state = { ...defaultState(), ...JSON.parse(fs.readFileSync(stateFile, "utf8")) };
+    const raw = getStore().read('state');
+    const state = { ...defaultState(), ...raw };
     state.assets = (state.assets || []).map(item => {
       const schema = item.inspection?.lerobotSchema;
       if (schema?.path) {
@@ -453,12 +473,6 @@ function readState() {
     state.annotations = Array.isArray(state.annotations) ? state.annotations : [];
     state.runs = Array.isArray(state.runs) ? state.runs : [];
     state.exports = normalizeExportHistory({ assets: state.assets, exports: Array.isArray(state.exports) ? state.exports : [] });
-    const deliveredBatches = new Map(state.exports.map(job => [job.batchId, job]).filter(([id]) => id));
-    state.bundles = (state.bundles || []).map(bundle => {
-      const delivery = deliveredBatches.get(bundle.id);
-      if (!delivery || !["待验收", "可提交验收"].includes(bundle.status)) return bundle;
-      return { ...bundle, status: "已验收", gateVersion: "episode-v2", acceptedAt: bundle.acceptedAt || delivery.createdAt || new Date().toISOString(), acceptedBy: bundle.acceptedBy || "系统恢复", acceptanceNote: bundle.acceptanceNote || `检测到已有 LeRobot 交付包 ${delivery.id}，恢复已验收状态` };
-    });
     state.datasets = Array.isArray(state.datasets) ? state.datasets : [];
     state.trainingJobs = Array.isArray(state.trainingJobs) ? state.trainingJobs : [];
     state.feedbackSamples = Array.isArray(state.feedbackSamples) ? state.feedbackSamples : [];
@@ -475,26 +489,73 @@ function readState() {
       state.rules = [...state.rules, ...rules.filter(rule => rule.locked && !knownCodes.has(rule.code))];
     }
     state.settings = { ...defaultSettings(), ...(state.settings || {}), thresholds: { ...defaultSettings().thresholds, ...(state.settings?.thresholds || {}) }, video: { ...defaultSettings().video, ...(state.settings?.video || {}) }, issueWeights: { ...defaultSettings().issueWeights, ...(state.settings?.issueWeights || {}) } };
-    return state;
-  } catch { return defaultState(); }
+    return getStore().track(state, 'state', raw);
 }
 function writeState(next) {
-  const temp = stateFile + ".tmp";
-  fs.writeFileSync(temp, JSON.stringify(next, null, 2), "utf8");
-  fs.renameSync(temp, stateFile);
+  getStore().write('state', next);
 }
 function readAuth() {
-  try {
-    const value = JSON.parse(fs.readFileSync(authFile, "utf8"));
+    const value = getStore().read('auth');
     const users = Array.isArray(value.users) ? value.users : [], ownerId = String(value.ownerId || users[0]?.id || "");
-    if (!value.ownerId && ownerId) { try { writeAuth({ ...value, ownerId }); } catch {} }
-    return { sessionSecret: String(value.sessionSecret || crypto.randomBytes(32).toString("base64url")), ownerId, users: users.map(user => ({ ...user, isPlatformOwner: user.id === ownerId, canDeleteData: user.id === ownerId ? true : user.canDeleteData === true })), nodeCredentials: Array.isArray(value.nodeCredentials) ? value.nodeCredentials : [] };
-  } catch { return { sessionSecret: crypto.randomBytes(32).toString("base64url"), users: [], nodeCredentials: [] }; }
+    if (!value.sessionSecret || !Array.isArray(value.users)) throw new Error('认证记录结构损坏，请恢复备份。');
+    return getStore().track({ ...value, ownerId, users: users.map(user => ({ ...user, isPlatformOwner: user.id === ownerId, canDeleteData: user.id === ownerId ? true : user.canDeleteData === true })), nodeCredentials: Array.isArray(value.nodeCredentials) ? value.nodeCredentials : [] }, 'auth', value);
 }
 function writeAuth(next) {
-  const temp = authFile + ".tmp";
-  fs.writeFileSync(temp, JSON.stringify(next, null, 2), "utf8");
-  fs.renameSync(temp, authFile);
+  getStore().write('auth', next);
+}
+function writeAccounts(auth, state) { getStore().writeMany([['auth', auth], ['state', state]]); }
+
+const JOB_ROUTES = { quality: '/api/qc/run', deep: '/api/assets/lerobot-deep-check', recheck: '/api/issues/recheck', convert: '/api/exports/convert', delivery: '/api/exports', backup: '/api/backup', verify: '/api/exports/verify' };
+function publicJob(job) {
+  const { key, sessionVersion, ...visible } = job;
+  return visible;
+}
+async function executeQueuedJob(job, progress) {
+  const auth = readAuth(), user = auth.users.find(item => item.id === job.userId && item.status === '正常');
+  if (!user || user.sessionVersion !== job.sessionVersion) throw new Error('任务提交账号或会话权限已变化，请重新提交。');
+  const route = JOB_ROUTES[job.kind];
+  if (!route) throw new Error('任务类型无效');
+  // Execute the same authenticated API path as an interactive request, rechecking
+  // role, domain and acceptance gates at execution time. No stored login cookies.
+  const { Readable } = require('node:stream');
+  const req = Readable.from([Buffer.from(JSON.stringify(job.payload))]);
+  Object.assign(req, { method: 'POST', url: route, headers: { host: 'localhost', cookie: createSessionCookie(auth, user).split(';')[0], 'content-type': 'application/json' }, socket: { remoteAddress: '127.0.0.1' }, progress });
+  let status, result;
+  const res = { writeHead(code) { status = code; }, end(bytes) { result = JSON.parse(bytes); } };
+  await handleApi(req, res, route, new URL(route, 'http://localhost'));
+  if (status >= 400 || !result?.ok) throw new Error(result?.error || '后台任务执行失败');
+  return { batchId: result.batch?.id, exportId: result.job?.id, passRate: result.batch?.passRate, issueCount: result.batch?.issueCount, closed: result.closed, remaining: result.remaining, ...result.backupResult, verification: result.verification, report: result.report, embodied: result.embodied, checked: result.checked, manual: result.manual, deep: result.deep };
+}
+
+async function inspectProductionAssets(state, ids, progress = () => {}) {
+  const selected = state.assets.filter(asset => ids.includes(asset.id) && asset.serverFile);
+  if (!selected.length) return;
+  const bundleIds = new Set(selected.map(asset => asset.bundleId));
+  const context = state.assets.filter(asset => asset.serverFile && bundleIds.has(asset.bundleId));
+  const manifest = path.join(workDir, `.inspection-${crypto.randomUUID()}.json`);
+  const python = findLerobotPython();
+  if (!python) throw new Error('未配置含 pyarrow 的 Python，无法执行生产质检；原问题保留。');
+  fs.writeFileSync(manifest, JSON.stringify({ assets: context.map(asset => ({ id: asset.id, role: asset.bundleRole, bundleId: asset.bundleId, relativePath: asset.relativePath || asset.name, path: path.join(uploadDir, asset.serverFile.storedName) })), settings: state.settings.video }));
+  progress({ completed: 0, total: selected.length, message: `正在逐帧解码和解析 ${selected.length} 个文件` });
+  try {
+    const { stdout } = await execFileAsync(python, [path.join(root, 'tools', 'production_check.py'), '--manifest', manifest], { timeout: 1800000, maxBuffer: 32 * 1024 * 1024, windowsHide: true });
+    const report = JSON.parse(stdout);
+    if (!report.ok) throw new Error(report.error || '生产检查未完成');
+    for (const result of report.files) {
+      const asset = selected.find(item => item.id === result.id);
+      if (!asset) continue;
+      const checkedAt = new Date().toISOString();
+      const mediaReview = asset.inspection?.production?.mediaReview;
+      const actualHash = await backupTools.digest(path.join(uploadDir, asset.serverFile.storedName));
+      asset.inspection = { ...(asset.inspection || {}), production: { ...result, ...(actualHash !== asset.serverFile.sha256 ? {error:'文件内容哈希与入库记录不一致，请恢复或替换源文件'} : {}), checkedAt, sha256: asset.serverFile.sha256, ...(mediaReview?.sha256 === actualHash ? { mediaReview } : {}) } };
+      if (result.schema) asset.inspection.lerobotSchema = { ...result.schema, checkedAt, parser: 'pyarrow' };
+      if (result.schema) asset.serverFile.deepCheck = { status: 'verified', detail: '已由 PyArrow 读取 Parquet 容器与内部列', checkedAt };
+      if (result.structure?.status === 'verified') asset.serverFile.contentCheck = { ...(asset.serverFile.contentCheck || {}), fields: result.structure.fields, recordCount: result.structure.recordCount };
+      if (result.media) asset.mediaMetadata = { width: result.media.width, height: result.media.height, duration: result.media.duration, fps: result.media.fps, verifiedBy: 'pyav' };
+    }
+    progress({ completed: selected.length, total: selected.length, message: '文件检查完成，正在归档问题证据' });
+  } catch (error) { throw new Error(`生产检查未完成，未关闭原问题：${error.message}`); }
+  finally { fs.rmSync(manifest, { force: true }); }
 }
 function publicUser(user) {
   return user ? { id: user.id, name: user.name, email: user.email, role: user.role, domain: user.domain, status: user.status, permissions: ROLE_POLICIES[user.role] || [], canDeleteData: user.canDeleteData === true, isPlatformOwner: user.isPlatformOwner === true } : null;
@@ -556,11 +617,11 @@ function permissionFor(req, pathname) {
     [/^\/api\/bundles(?:\/status)?$/, ["资产管理"]],
     [/^\/api\/imports\/rollback$/, ["资产上传", "资产管理"]],
     [/^\/api\/assets\/lerobot-deep-check$/, ["运行质检", "资产管理"]], [/^\/api\/assets\/[^/]+$/, ["删除数据"]], [/^\/api\/assets$/, ["资产上传", "资产管理"]], [/^\/api\/tasks(?:\/status)?$/, ["采集任务"]],
-    [/^\/api\/annotations\//, ["标注编辑", "标注审核", "资产管理"]], [/^\/api\/exports(?:\/convert)?$/, ["数据集发布"]],
+    [/^\/api\/annotations\//, ["标注编辑", "标注审核", "资产管理"]], [/^\/api\/exports(?:\/(?:convert|verify))?$/, ["数据集发布"]],
     [/^\/api\/datasets(?:\/status)?$/, ["数据集发布"]], [/^\/api\/training\/feedback$/, ["失败样本回流", "训练调度"]],
     [/^\/api\/training(?:\/status)?$/, ["训练调度"]], [/^\/api\/nodes/, ["节点管理"]],
     [/^\/api\/members/, ["成员管理"]], [/^\/api\/qc/, ["运行质检", "资产管理"]], [/^\/api\/issues\/recheck$/, ["运行质检", "问题处置"]],
-    [/^\/api\/episode-tags$/, ["标注审核", "资产管理"]], [/^\/api\/issues\/update$/, ["问题处置"]],
+    [/^\/api\/episode-tags$/, ["标注审核", "资产管理"]], [/^\/api\/issues\/(update|review-media)$/, ["问题处置"]],
     [/^\/api\/rules\//, ["规则管理"]], [/^\/api\/(settings|backup|storage\/reconcile)$/, ["平台设置"]],
   ];
   return rules.find(([pattern]) => pattern.test(pathname))?.[1] || null;
@@ -637,7 +698,7 @@ function scopedState(state, user) {
   const annotationStandards = Object.fromEntries(Object.entries(state.annotationStandards || {}).filter(([key]) => annotationGroupKeys.has(key)));
   const exports = hasPermission(user, ["数据集发布"]) ? state.exports.filter(job => (job.assetIds || []).every(id => assetIds.has(id))).map(job => {
     const gate = bundleGate(state, job.batchId, user), fingerprint = deliverySourceFingerprint(state, job);
-    return { ...job, conversions: Object.fromEntries(Object.entries(job.conversions || {}).map(([format, output]) => [format, { ...output, current: output.ok === true && gate?.ready === true && gate.status === "已验收" && output.sourceFingerprint === fingerprint }])) };
+    return { ...job, conversions: Object.fromEntries(Object.entries(job.conversions || {}).map(([format, output]) => [format, { ...output, current: output.ok === true && output.independentVerification?.ok === true && gate?.ready === true && gate.status === "已验收" && output.sourceFingerprint === fingerprint }])) };
   }) : [];
   return { ...state, assets, tasks, issues, annotations, annotationStandards, annotationGroups, v6Workflows, nodes, qcBatches, runs, datasets, trainingJobs, feedbackSamples, rules, episodeTags, bundles, exports, members: hasPermission(user, ["成员管理"]) ? state.members : [], audit: hasPermission(user, ["成员管理", "平台设置"]) ? state.audit : [] };
 }
@@ -748,10 +809,12 @@ function inspectContainerFile(filePath, originalName, contentCheck) {
 }
 
 async function streamAssetContent(req, assetId, originalName) {
-  const declared = Number(req.headers["content-length"] || 0);
+  const declared = Number(req.headers?.["content-length"] || 0);
   if (declared > MAX_UPLOAD) { const error = new Error("文件超过 20GB 上限"); error.status = 413; throw error; }
   const state = readState(), asset = state.assets.find(item => item.id === assetId);
   if (!asset) { const error = new Error("资产不存在，请先创建资产元数据"); error.status = 404; throw error; }
+  const acceptedBundle = state.bundles.find(bundle => bundle.id === asset.bundleId && ['已验收', '已归档'].includes(bundle.status));
+  if (acceptedBundle) { const error = new Error('已验收批次禁止替换原文件，请建立修订批次'); error.status = 409; throw error; }
   const tempName = `.upload-${assetId}-${crypto.randomBytes(6).toString("hex")}.tmp`, tempPath = path.join(uploadDir, tempName);
   const hash = crypto.createHash("sha256"), sample = []; let sampleSize = 0, size = 0;
   const inspect = new Transform({ transform(chunk, encoding, callback) {
@@ -765,13 +828,13 @@ async function streamAssetContent(req, assetId, originalName) {
   catch (error) { try { fs.unlinkSync(tempPath); } catch {} throw error; }
   if (!size) { try { fs.unlinkSync(tempPath); } catch {} const error = new Error("上传文件为空"); error.status = 400; throw error; }
   const sha256 = hash.digest("hex"), duplicate = state.assets.find(item => item.id !== assetId && item.serverFile?.sha256 === sha256);
-  if (duplicate) { fs.unlinkSync(tempPath); const error = new Error("文件已存在"); error.status = 409; error.extra = { duplicateId: duplicate.id, duplicateName: duplicate.name }; throw error; }
+  // Identical metadata across batches is valid. Each asset retains its own stored file.
   const contentCheck = detectSignature(Buffer.concat(sample), originalName, size);
   const storedName = `${assetId}-${Date.now()}-${safeName(originalName)}`, finalPath = path.join(uploadDir, storedName);
+  const descriptor = fs.openSync(tempPath, 'r+'); try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
   fs.renameSync(tempPath, finalPath);
   const deepCheck = inspectContainerFile(finalPath, originalName, contentCheck);
-  const oldPath = asset.serverFile?.storedName ? path.join(uploadDir, asset.serverFile.storedName) : "";
-  if (oldPath && oldPath !== finalPath && oldPath.startsWith(uploadDir)) { try { fs.unlinkSync(oldPath); } catch {} }
+  // Retain superseded files for explicit storage reconciliation instead of deleting bytes during replacement.
   const serverFile = { storedName, originalName, sha256, size, contentCheck, deepCheck, storedAt: new Date().toISOString(), uploadMode: "stream" };
   Object.assign(asset, { size, format: contentCheck.extension || asset.format, serverFile, serverManaged: true, status: "待质检", score: 0, updatedAt: new Date().toISOString() });
   audit(state, "接收原始文件", asset.id, `${originalName} · ${size} bytes · SHA-256 ${sha256.slice(0, 16)} · ${deepCheck.detail}`);
@@ -898,6 +961,20 @@ function evaluateAsset(asset, template, state) {
     return { score: null, threshold, status: "待补传", detail: { sync: null, complete: null, action: null, sensor: null }, issues, evidence: ["仅有历史元数据"] };
   }
   const check = asset.serverFile.contentCheck || {};
+  const production = asset.inspection?.production;
+  if (!production || production.sha256 !== asset.serverFile.sha256) add('production_evidence', '服务端检查证据', '高', '尚无绑定当前文件哈希的生产检查证据，请执行完整质检');
+  else {
+    if (production.error) add('production_evidence', '文件解析失败', '高', production.error);
+    if (production.structure?.status === 'not_supported') add('production_evidence', '解析器未接入', '高', production.structure.issues.join('；'));
+    if (production.media?.status === 'invalid') {
+      const reviewed = production.mediaReview?.sha256 === asset.serverFile.sha256 && production.mediaReview?.approved === true;
+      const pending = (production.media.findings || []).filter(finding => !reviewed || !['black_frames', 'frozen_frames'].includes(finding.code));
+      if (pending.length || !production.media.findings?.length) add('production_evidence', '视频解码与同步', '高', pending.length ? pending.map(item => item.message).join('；') : production.media.issues.join('；'));
+      if (reviewed) evidence.push(`黑屏/静止候选人工复核：${production.mediaReview.reviewer} · ${production.mediaReview.note}`);
+    }
+    if (production.schema?.status === 'invalid') add('production_evidence', '轨迹字段与数值', '高', production.schema.issues.join('；'));
+    evidence.push(`服务端检查 ${production.checkedAt} · 文件哈希 ${production.sha256}`);
+  }
   evidence.push(`SHA-256 ${asset.serverFile.sha256}`, `文件签名 ${check.signature || "unknown"}`, `文件大小 ${asset.serverFile.size} bytes`);
   if (!asset.serverFile.size) add("file_signature", "文件内容", "高", "文件为空");
   if (check.valid === false) add("file_signature", "文件格式签名", "高", `扩展名与文件头不匹配（${check.signature || "unknown"}）`);
@@ -973,8 +1050,20 @@ function selectQcTargets(state, scope, model, targetIds) {
   if (model && model !== "全部模型") list = list.filter(asset => asset.model === model);
   return list;
 }
-function runQc(state, request, user = null) {
-  const started = Date.now(), runStartedAt = new Date().toISOString(), scope = request.scope || "待质检数据", template = request.template || "标准质检", model = request.model || "全部模型";
+function reopenAcceptance(state, bundleIds, reason) {
+  let changed = 0;
+  for (const bundle of state.bundles || []) {
+    if (!bundleIds.has(bundle.id) || !['待验收', '已验收', '已归档'].includes(bundle.status)) continue;
+    const snapshot = { id: crypto.randomUUID(), status: bundle.status, acceptedAt: bundle.acceptedAt, acceptedBy: bundle.acceptedBy, submittedAt: bundle.submittedAt, submittedBy: bundle.submittedBy, note: bundle.acceptanceNote, reopenedAt: new Date().toISOString(), reason };
+    bundle.acceptanceHistory = [...(bundle.acceptanceHistory || []), snapshot];
+    bundle.status = '待复检'; bundle.acceptanceNote = reason;
+    for (const key of ['acceptedAt', 'acceptedBy', 'submittedAt', 'submittedBy']) delete bundle[key];
+    audit(state, '重新打开批次验收', bundle.id, reason); changed++;
+  }
+  return changed;
+}
+function runQc(state, request, user = null, started = Date.now()) {
+  const runStartedAt = new Date(started).toISOString(), scope = request.scope || "待质检数据", template = request.template || "标准质检", model = request.model || "全部模型";
   const targets = selectQcTargets(state, scope, model, request.targetIds).filter(asset => typeAllowed(user, asset.type)), now = new Date().toLocaleString("zh-CN", { hour12: false });
   const results = targets.map(asset => ({ assetId: asset.id, name: asset.name, type: asset.type, model: asset.model || "未关联", ...evaluateAsset(asset, template, state) }));
   results.forEach(result => { const asset = state.assets.find(item => item.id === result.assetId); Object.assign(asset, { score: result.score || 0, status: result.status, lastQcAt: now, qcTemplate: template }); });
@@ -982,7 +1071,8 @@ function runQc(state, request, user = null) {
   results.forEach(result => result.issues.forEach(issue => {
     const key = `${result.assetId}:${issue.metric}`; activeKeys.add(key);
     const existing = state.issues.find(item => item.key === key);
-    const record = { key, id: `ISS-${crypto.createHash("sha1").update(key).digest("hex").slice(0, 10).toUpperCase()}`, assetId: result.assetId, assetName: result.name, type: result.type, metric: issue.metric, level: issue.level, detail: issue.detail, updatedAt: now };
+    const asset = state.assets.find(item => item.id === result.assetId), production = asset?.inspection?.production;
+    const record = { key, id: `ISS-${crypto.createHash("sha1").update(key).digest("hex").slice(0, 10).toUpperCase()}`, assetId: result.assetId, assetName: result.name, type: result.type, metric: issue.metric, level: issue.level, detail: issue.detail, updatedAt: now, ruleId: issue.ruleId, relativePath: asset?.relativePath || result.name, sourceSha256: asset?.serverFile?.sha256, locations: [...(production?.schema?.findings || []), ...(production?.media?.findings || [])].slice(0, 100), evidenceVersion: 'production-evidence-v1' };
     if (existing) {
       const wasClosed = existing.status === "已关闭";
       Object.assign(existing, record, { status: wasClosed ? "待处理" : existing.status, assignee: wasClosed ? "未分配" : (existing.assignee || "未分配"), resolution: wasClosed ? `问题再次检出；上次处置：${existing.resolution || "未填写"}` : (existing.resolution || ""), verification: wasClosed ? null : (existing.verification || null), closedAt: wasClosed ? null : (existing.closedAt || null), closedBy: wasClosed ? null : (existing.closedBy || null) });
@@ -1002,7 +1092,7 @@ function runQc(state, request, user = null) {
     }
   });
   const passed = results.filter(item => item.status === "已通过").length, issueCount = results.reduce((sum, item) => sum + item.issues.length, 0);
-  const batch = { id: "QC-" + Date.now().toString(36).toUpperCase(), scope, template, model, total: results.length, passed, passRate: results.length ? Number((passed / results.length * 100).toFixed(1)) : 0, issueCount, duration: Number(((Date.now() - started) / 1000).toFixed(2)), status: "已完成", createdAt: now, operator: "系统质检引擎", engine: "evidence-v2", results, targetIds: results.map(item => item.assetId), ruleSnapshot: state.rules.filter(rule => rule.enabled !== false).map(rule => rule.id), settingsSnapshot: state.settings };
+  const batch = { id: "QC-" + Date.now().toString(36).toUpperCase(), scope, template, model, total: results.length, passed, passRate: results.length ? Number((passed / results.length * 100).toFixed(1)) : 0, issueCount, duration: Number(((Date.now() - started) / 1000).toFixed(2)), status: "已完成", createdAt: now, operator: "系统质检引擎", engine: "production-evidence-v1", results, targetIds: results.map(item => item.assetId), ruleSnapshot: state.rules.filter(rule => rule.enabled !== false).map(rule => rule.id), settingsSnapshot: state.settings };
   state.qcBatches.unshift(batch); state.qcBatches = state.qcBatches.slice(0, 100);
   const run = { id: "RUN-" + Date.now().toString(36).toUpperCase(), kind: "质检", batchId: batch.id, scope, status: "已完成", startedAt: runStartedAt, finishedAt: new Date().toISOString(), duration: batch.duration, operator: "系统质检引擎", targetIds: batch.targetIds, summary: { total: batch.total, passed: batch.passed, passRate: batch.passRate, issueCount: batch.issueCount }, nodes: [{ id: "input", label: "读取批次", status: "已完成", detail: `${targets.length} 个资产` }, { id: "validate", label: "结构与媒体校验", status: "已完成", detail: `${results.length} 个对象` }, { id: "rules", label: "规则执行", status: "已完成", detail: `${batch.ruleSnapshot.length} 条启用规则` }, { id: "evidence", label: "问题与证据归档", status: "已完成", detail: `${issueCount} 个问题` }], evidence: results.slice(0, 200).map(item => ({ assetId: item.assetId, name: item.name, status: item.status, score: item.score, issues: (item.issues || []).map(issue => issue.metric), evidence: item.evidence || [] })) };
   state.runs.unshift(run); state.runs = state.runs.slice(0, 100);
@@ -1010,6 +1100,7 @@ function runQc(state, request, user = null) {
   state.issues.forEach(issue => {
     if (issue.verification?.verified === true && issue.verification.batchId == null && batch.targetIds.includes(issue.assetId) && issue.closedAt) issue.verification.batchId = batch.id;
   });
+  reopenAcceptance(state, new Set(targets.filter(asset => asset.status !== '已通过').map(asset => asset.bundleId)), '本次真实检查发现异常，原验收已存入历史，请修复后重新提交');
   audit(state, "执行证据型质检", batch.id, `${template} · ${scope} · ${results.length} 个资产 · ${passed} 个通过 · ${issueCount} 个问题`);
   return batch;
 }
@@ -1396,6 +1487,7 @@ function rebuildLegacyExportManifests(state) {
   return rebuilt;
 }
 
+function hasProductionEvidence(asset) { return Boolean(asset.serverFile?.sha256 && asset.inspection?.production?.sha256 === asset.serverFile.sha256 && !asset.inspection.production.error); }
 function bundleGate(state, bundleId, user = null) {
   const assets = state.assets.filter(asset => !asset.isDemo && asset.bundleId === bundleId && typeAllowed(user, asset.type));
   if (!assets.length) return null;
@@ -1416,10 +1508,11 @@ function bundleGate(state, bundleId, user = null) {
   const annotationPending = episodeAssets.filter(asset => !approvedGroupKeys.has(annotationGroupKeyForAsset(asset)));
   const originalCount = assets.filter(asset => asset.serverFile).length, qcCount = assets.filter(asset => asset.lastQcAt).length;
   const complete = episodeAssetIds.size > 0 && ["meta", "trajectory", "media"].every(role => roleSet.has(role));
-  const ready = complete && episodeMediaPending === 0 && originalCount === assets.length && qcCount === assets.length && assets.every(asset => asset.status === "已通过") && issues.length === 0 && annotationPending.length === 0;
+  const productionEvidencePending = assets.filter(asset => !hasProductionEvidence(asset)).length;
+  const ready = productionEvidencePending === 0 && complete && episodeMediaPending === 0 && originalCount === assets.length && qcCount === assets.length && assets.every(asset => asset.status === "已通过") && issues.length === 0 && annotationPending.length === 0;
   const derivedStatus = ready ? "可提交验收" : issues.length ? "需处理" : episodeMediaPending || !complete ? "待补齐" : annotationPending.length ? "待审核" : "待质检";
   const status = ready && stored.gateVersion === "episode-v2" && ["待验收", "已验收", "已归档"].includes(stored.status) ? stored.status : derivedStatus;
-  return { id: bundleId, name: stored.name || assets[0].bundleName || bundleId, type: assets[0].type, preset: stored.preset || assets[0].bundlePreset || "", gateVersion: stored.gateVersion || "", assetCount: assets.length, episodeCount: episodeAssetIds.size, roles, complete, episodeMediaPending, expectedMediaViews, expectedMediaViewCount: mediaViewPolicy.expectedCount, mediaViewPolicySource: mediaViewPolicy.source, mediaViewCount: actualMediaViews.size, missingViewCount, originalCount, qcCount, issueCount: issues.length, annotationCount: episodeAssetIds.size, annotationPending: annotationPending.length, ready, status, submittedAt: stored.submittedAt || null, submittedBy: stored.submittedBy || null, acceptedAt: stored.acceptedAt || null, acceptedBy: stored.acceptedBy || null, acceptanceNote: stored.acceptanceNote || "" };
+  return { id: bundleId, name: stored.name || assets[0].bundleName || bundleId, type: assets[0].type, preset: stored.preset || assets[0].bundlePreset || "", gateVersion: stored.gateVersion || "", assetCount: assets.length, productionEvidencePending, episodeCount: episodeAssetIds.size, roles, complete, episodeMediaPending, expectedMediaViews, expectedMediaViewCount: mediaViewPolicy.expectedCount, mediaViewPolicySource: mediaViewPolicy.source, mediaViewCount: actualMediaViews.size, missingViewCount, originalCount, qcCount, issueCount: issues.length, annotationCount: episodeAssetIds.size, annotationPending: annotationPending.length, ready, status, submittedAt: stored.submittedAt || null, submittedBy: stored.submittedBy || null, acceptedAt: stored.acceptedAt || null, acceptedBy: stored.acceptedBy || null, acceptanceNote: stored.acceptanceNote || "" };
 }
 
 function bundleList(state, user = null) {
@@ -1433,10 +1526,10 @@ function deriveV6Workflow(state, bundleId, user = null) {
   const assets = state.assets.filter(asset => !asset.isDemo && asset.bundleId === bundleId && typeAllowed(user, asset.type));
   const exportJob = state.exports.find(job => job.batchId === bundleId || (job.batchIds || []).includes(bundleId));
   const openIssues = state.issues.filter(issue => issue.status !== "已关闭" && assets.some(asset => asset.id === issue.assetId)).length;
-  const qcDone = assets.length > 0 && assets.every(asset => asset.lastQcAt);
+  const qcDone = assets.length > 0 && assets.every(asset => asset.lastQcAt && hasProductionEvidence(asset));
   const uploaded = assets.length > 0 && assets.every(asset => asset.serverFile);
   const deliveryDone = Boolean(exportJob?.lerobotDirectory), checked = exportJob?.lerobotValidation?.ok === true;
-  const conversionDone = format => exportJob?.conversions?.[format]?.ok === true && gate.ready && gate.status === "已验收" && exportJob.conversions[format].sourceFingerprint === deliverySourceFingerprint(state, exportJob);
+  const conversionDone = format => exportJob?.conversions?.[format]?.ok === true && exportJob?.conversions?.[format]?.independentVerification?.ok === true && gate.ready && gate.status === "已验收" && exportJob.conversions[format].sourceFingerprint === deliverySourceFingerprint(state, exportJob);
   const done = {
     start: true,
     pico_upload: uploaded,
@@ -1508,7 +1601,7 @@ function reconcileStorage(state) {
 }
 
 async function handleApi(req, res, pathname, url) {
-  if (req.method === "OPTIONS") { res.writeHead(204, { "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS", "Access-Control-Allow-Headers": "Content-Type,X-File-Name" }); res.end(); return true; }
+  if (req.method === "OPTIONS") { res.writeHead(204, { "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "Access-Control-Allow-Headers": "Content-Type,X-File-Name,Upload-Offset" }); res.end(); return true; }
   if (!pathname.startsWith("/api/")) return false;
   ensureStorage(); const state = readState(), auth = readAuth();
   state.members = state.members.map(member => { const account = auth.users.find(item => item.id === member.id); return { ...member, permissions: ROLE_POLICIES[member.role] || member.permissions || [], canDeleteData: account?.canDeleteData === true, isPlatformOwner: account?.id === auth.ownerId }; });
@@ -1529,7 +1622,7 @@ async function handleApi(req, res, pathname, url) {
         if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("请填写姓名和有效工作邮箱");
         const id = `MEM-${Date.now().toString(36).toUpperCase()}`, passwordRecord = hashPassword(password), now = new Date().toISOString();
         const user = { id, name, email, role: "数据治理负责人", domain: "全部数据域", status: "正常", canDeleteData: true, isPlatformOwner: true, passwordSalt: passwordRecord.salt, passwordHash: passwordRecord.hash, sessionVersion: 1, createdAt: now, updatedAt: now };
-        auth.ownerId = id; auth.users.push(user); state.members.push({ ...publicUser(user), createdAt: now, updatedAt: now }); audit(state, "初始化平台管理员", id, `${name} · ${email}`, name); writeAuth(auth); writeState(state);
+        auth.ownerId = id; auth.users.push(user); state.members.push({ ...publicUser(user), createdAt: now, updatedAt: now }); audit(state, "初始化平台管理员", id, `${name} · ${email}`, name); writeAccounts(auth, state);
         sendJson(res, 201, { ok: true, authMode: "local", user: publicUser(user) }, { "Set-Cookie": createSessionCookie(auth, user) }); return true;
       }
       const attemptKey = loginAttemptKey(req, email); checkLoginLimit(attemptKey);
@@ -1538,11 +1631,11 @@ async function handleApi(req, res, pathname, url) {
       loginFailures.delete(attemptKey);
       user.lastLoginAt = new Date().toISOString(); user.updatedAt = user.lastLoginAt;
       const member = state.members.find(item => item.id === user.id); if (member) { member.lastLoginAt = user.lastLoginAt; member.updatedAt = user.updatedAt; }
-      writeAuth(auth); audit(state, "账号登录", user.id, `${user.email} · ${req.socket.remoteAddress || "本机"}`, user.name); writeState(state);
+      audit(state, "账号登录", user.id, `${user.email} · ${req.socket.remoteAddress || "本机"}`, user.name); writeAccounts(auth, state);
       sendJson(res, 200, { ok: true, authMode: "local", user: publicUser(user) }, { "Set-Cookie": createSessionCookie(auth, user) }); return true;
     } catch (error) { sendError(res, error.status || 400, error.message || "认证请求失败"); return true; }
   }
-  if (req.method === "POST" && pathname === "/api/auth/logout") { if (currentUser) { currentUser.sessionVersion = Number(currentUser.sessionVersion || 1) + 1; currentUser.updatedAt = new Date().toISOString(); writeAuth(auth); audit(state, "账号退出", currentUser.id, "会话已吊销", currentUser.name); writeState(state); } sendJson(res, 200, { ok: true }, { "Set-Cookie": "embodied_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" }); return true; }
+  if (req.method === "POST" && pathname === "/api/auth/logout") { if (currentUser) { currentUser.sessionVersion = Number(currentUser.sessionVersion || 1) + 1; currentUser.updatedAt = new Date().toISOString(); audit(state, "账号退出", currentUser.id, "会话已吊销", currentUser.name); writeAccounts(auth, state); } sendJson(res, 200, { ok: true }, { "Set-Cookie": "embodied_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" }); return true; }
   if (!currentUser) { sendError(res, 401, auth.users.length ? "登录会话无效或已过期" : "请先完成管理员初始化", { authMode: "local", setupRequired: auth.users.length === 0 }); return true; }
   if (req.method === "GET" && pathname === "/api/auth/me") { sendJson(res, 200, { ok: true, user: publicUser(currentUser), authMode: "local" }); return true; }
   if (req.method === "POST" && pathname === "/api/auth/password") {
@@ -1551,7 +1644,7 @@ async function handleApi(req, res, pathname, url) {
       if (!verifyPassword(body.currentPassword, currentUser)) { sendError(res, 401, "当前密码不正确"); return true; }
       if (body.currentPassword === nextPassword) throw new Error("新密码不能与当前密码相同");
       const record = hashPassword(nextPassword); Object.assign(currentUser, { passwordSalt: record.salt, passwordHash: record.hash, sessionVersion: Number(currentUser.sessionVersion || 1) + 1, updatedAt: new Date().toISOString() });
-      writeAuth(auth); audit(state, "修改登录密码", currentUser.id, "密码已更新，其他会话全部失效", currentUser.name); writeState(state);
+      audit(state, "修改登录密码", currentUser.id, "密码已更新，其他会话全部失效", currentUser.name); writeAccounts(auth, state);
       sendJson(res, 200, { ok: true, user: publicUser(currentUser) }, { "Set-Cookie": createSessionCookie(auth, currentUser) }); return true;
     } catch (error) { sendError(res, error.status || 400, error.message || "密码修改失败"); return true; }
   }
@@ -1560,6 +1653,71 @@ async function handleApi(req, res, pathname, url) {
     if (required && !hasPermission(currentUser, required, auth)) { sendError(res, 403, `当前角色无权执行：${required.join(" 或 ")}`, { required }); return true; }
   }
   if (req.method === "GET") { const required = readPermissionFor(pathname); if (required && !hasPermission(currentUser, required)) { sendError(res, 403, `当前角色无权读取：${required.join(" 或 ")}`, { required }); return true; } }
+
+  if (pathname === '/api/jobs' && req.method === 'GET') { sendJson(res, 200, { ok: true, jobs: taskQueue.list().filter(job => job.userId === currentUser.id || hasPermission(currentUser, ['平台设置'])).slice(0, 100).map(publicJob) }); return true; }
+  if (pathname === '/api/jobs' && req.method === 'POST') {
+    try {
+      const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+      let kind = body.kind, payload = body.payload || {}, retryOf = null;
+      if (body.retryOf) {
+        const prior = taskQueue.list().find(job => job.id === body.retryOf && job.userId === currentUser.id);
+        if (!prior || !['failed', 'interrupted'].includes(prior.status)) throw new Error('只能重试自己失败或中断的任务');
+        kind = prior.kind; payload = prior.payload; retryOf = prior.id;
+      }
+      if (!JOB_ROUTES[kind] || !payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('后台任务参数无效');
+      const required = permissionFor({ method: 'POST' }, JOB_ROUTES[kind]);
+      if (!required || !hasPermission(currentUser, required, auth)) { sendError(res, 403, '无权提交该后台任务'); return true; }
+      const job = taskQueue.enqueue(kind, payload, currentUser, retryOf);
+      sendJson(res, 202, { ok: true, job: publicJob(job) });
+    } catch (error) { sendError(res, error.status || 400, error.message); }
+    return true;
+  }
+  if (pathname === '/api/health/details' && req.method === 'GET') {
+    if (!hasPermission(currentUser, ['平台设置'])) { sendError(res, 403, '无权读取运维状态'); return true; }
+    const python = findLerobotPython();
+    let media = false;
+    if (python) media = spawnSync(python, ['-c', 'import av'], { timeout: 5000, windowsHide: true }).status === 0;
+    sendJson(res, 200, { ok: true, database: 'sqlite-wal', authentication: 'ready', storage: fs.existsSync(uploadDir) ? 'ready' : 'error', python: python ? 'ready' : 'missing', mediaDecoder: media ? 'ready' : 'missing', optionalPlugin: findEmbodiedInvocation() ? 'configured' : 'not_configured', queue: taskQueue.list().reduce((counts, job) => { counts[job.status] = (counts[job.status] || 0) + 1; return counts; }, {}) }); return true;
+  }
+
+
+  if (pathname.startsWith('/api/uploads')) {
+    try {
+      if (!hasPermission(currentUser, ['资产上传', '资产管理'])) { sendError(res, 403, '无权上传文件'); return true; }
+      resumableUploads ||= new ResumableUploads(getStore());
+      const match = /^\/api\/uploads\/([a-f0-9-]+)(?:\/(complete))?$/.exec(pathname);
+      if (pathname === '/api/uploads' && req.method === 'POST') {
+        const body = JSON.parse((await readBody(req)).toString('utf8'));
+        const asset = state.assets.find(item => item.id === body.assetId);
+        if (!asset) throw new Error('请先创建资产');
+        assertTypeAllowed(currentUser, asset.type);
+        const bundle = state.bundles.find(item => item.id === asset.bundleId);
+        if (bundle && ['已验收', '已归档'].includes(bundle.status)) throw new Error('已验收批次禁止替换文件；请创建修订批次。');
+        sendJson(res, 201, { ok: true, upload: resumableUploads.start(asset, body, currentUser) }); return true;
+      }
+      const session = match && getStore().read('uploads').find(item => item.id === match[1] && item.userId === currentUser.id);
+      if (!session) { sendError(res, 404, '上传会话不存在'); return true; }
+      const asset = state.assets.find(item => item.id === session.assetId);
+      if (!asset) throw new Error('上传资产已删除');
+      assertTypeAllowed(currentUser, asset.type);
+      if (req.method === 'PATCH' && !match[2]) {
+        const upload = await resumableUploads.append(session.id, Number(req.headers['upload-offset']), await readBody(req, 4 * 1024 ** 2), currentUser);
+        sendJson(res, 200, { ok: true, upload }); return true;
+      }
+      if (req.method === 'POST' && match[2]) {
+        await resumableUploads.complete(session.id, currentUser, async (upload, file) => {
+          // Stream the committed temporary file through the same signature/hash and
+          // metadata path as a conventional upload. The partial remains recoverable.
+          await streamAssetContent(fs.createReadStream(file), asset.id, upload.name);
+        });
+        sendJson(res, 201, { ok: true, asset: readState().assets.find(item => item.id === asset.id) }); return true;
+      }
+      if (req.method === 'GET') { sendJson(res, 200, { ok: true, upload: session }); return true; }
+      sendError(res, 405, '不支持的上传方法');
+    } catch (error) { sendError(res, error.status || 400, error.message); }
+    return true;
+  }
+
   const visible = scopedState(state, currentUser);
   const packageRoute = /^\/api\/exports\/([^/]+)\/package$/.exec(pathname);
   if (req.method === "GET" && packageRoute) {
@@ -1568,9 +1726,10 @@ async function handleApi(req, res, pathname, url) {
     const output = job.conversions?.[url.searchParams.get("format") || "lerobot"];
     const gate = bundleGate(state, job.batchId, currentUser);
     if (!gate?.ready || gate.status !== "已验收" || output?.sourceFingerprint !== deliverySourceFingerprint(state, job)) { sendError(res, 409, "当前批次门禁或源数据版本已变化，请重新转换"); return true; }
-    if (!output?.ok || !output.archive) { sendError(res, 404, "该格式尚未完成转换"); return true; }
+    if (!output?.ok || !output.archive || !output.independentVerification?.ok) { sendError(res, 404, "该格式尚未完成转换"); return true; }
     const target = path.resolve(output.archive);
     if (!target.startsWith(path.resolve(deliveryDir) + path.sep) || !fs.existsSync(target)) { sendError(res, 404, "交付包文件不存在"); return true; }
+    if (await backupTools.digest(target) !== output.archiveSha256) { sendError(res, 409, '交付包哈希不一致，请重新转换'); return true; }
     res.writeHead(200, { "Content-Type": "application/zip", "Content-Length": fs.statSync(target).size, "Content-Disposition": `attachment; filename="${safeName(job.id)}-${safeName(output.format)}.zip"` });
     const stream = fs.createReadStream(target); stream.on("error", () => res.destroy()); stream.pipe(res); return true;
   }
@@ -1649,6 +1808,7 @@ async function handleApi(req, res, pathname, url) {
     const contentType = String(req.headers["content-type"] || "");
     if (contentType.includes("multipart/form-data")) { sendError(res, 415, "旧版整包上传已停用，请刷新页面后使用流式上传"); return true; }
     const body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+    const operationStartedAt = Date.now();
     body.user = currentUser.name;
     if (pathname === "/api/exports/convert") {
       const target = String(body.format || "").toLowerCase();
@@ -1662,7 +1822,7 @@ async function handleApi(req, res, pathname, url) {
       const originalManifest = JSON.parse(fs.readFileSync(path.join(exportDir, job.fileName), "utf8"));
       if (assets.length !== job.assetIds.length || assets.some(asset => !originalManifest.assets.some(item => item.id === asset.id && item.sha256 === asset.serverFile?.sha256))) { sendError(res, 409, "源文件与基础交付快照不同，需要建立新的交付版本"); return true; }
       const fingerprint = deliverySourceFingerprint(state, job);
-      if (job.conversions?.[target]?.sourceFingerprint === fingerprint && fs.existsSync(job.conversions[target].archive)) { sendJson(res, 200, { ok: true, duplicate: true, job, exports: visible.exports }); return true; }
+      if (job.conversions?.[target]?.sourceFingerprint === fingerprint && job.conversions[target].independentVerification?.ok && fs.existsSync(job.conversions[target].archive) && await backupTools.digest(job.conversions[target].archive) === job.conversions[target].archiveSha256) { sendJson(res, 200, { ok: true, duplicate: true, job, exports: visible.exports }); return true; }
       if (activeDeliveryConversions.has(job.id)) { sendError(res, 409, "该批次正在转换，请等待完成后再操作"); return true; }
       activeDeliveryConversions.add(job.id);
       try {
@@ -1672,16 +1832,24 @@ async function handleApi(req, res, pathname, url) {
         const conversionRoot = path.join(deliveryDir, safeName(job.id), "converted"); fs.mkdirSync(conversionRoot, { recursive: true });
         const runName = `${target}-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`, annotationPath = path.join(conversionRoot, `${runName}-annotations.jsonl`);
         fs.writeFileSync(annotationPath, built.annotationLines.join("\n") + "\n", "utf8");
+        const evidencePath = path.join(conversionRoot, `${runName}-evidence.json`);
+        fs.writeFileSync(evidencePath, JSON.stringify({ schemaVersion: '1.0', generatedAt: new Date().toISOString(), batch: { id: gate.id, status: gate.status, acceptedAt: gate.acceptedAt, acceptedBy: gate.acceptedBy }, sourceFingerprint: fingerprint, rules: state.rules, qualitySettings: state.settings, inspections: assets.map(asset => ({ id: asset.id, relativePath: asset.relativePath, sha256: asset.serverFile?.sha256, inspection: asset.inspection, qcBatchId: asset.qcBatchId })), annotations: built.annotationLines.map(line => JSON.parse(line)), runs: state.runs.filter(run => run.targetIds?.some(id => job.assetIds.includes(id))).slice(0, 20) }, null, 2));
         let report;
         try {
-          const { stdout } = await execFileAsync(python, [path.join(root, "tools", "delivery_convert.py"), "--source", job.lerobotDirectory, "--output", path.join(conversionRoot, runName), "--target", target, "--annotations", annotationPath], { timeout: 1800000, maxBuffer: 32 * 1024 * 1024, windowsHide: true });
+          const { stdout } = await execFileAsync(python, [path.join(root, "tools", "delivery_convert.py"), "--source", job.lerobotDirectory, "--output", path.join(conversionRoot, runName), "--target", target, "--annotations", annotationPath, "--evidence", evidencePath], { timeout: 1800000, maxBuffer: 32 * 1024 * 1024, windowsHide: true });
           report = JSON.parse(stdout.trim());
           if (report.ok !== true) throw new Error(report.error || "转换验证失败");
+          req.progress?.({ completed: 0, total: report.episodes, message: '转换完成，正在独立解包、回读和逐帧解码视频' });
+          const checked = await execFileAsync(python, [path.join(root, 'tools', 'verify_delivery.py'), '--archive', report.archive, '--target', target], { timeout: 1800000, maxBuffer: 16 * 1024 * 1024, windowsHide: true });
+          const verification = JSON.parse(checked.stdout);
+          if (!verification.ok || verification.archiveSha256 !== report.archiveSha256) throw new Error(verification.error || '独立交付验证失败');
+          report.independentVerification = { ...verification, checkedAt: new Date().toISOString() };
+          req.progress?.({ completed: report.episodes, total: report.episodes, message: '独立交付检查完成' });
         } catch (error) {
           let detail = error.message;
           try { detail = JSON.parse(String(error.stdout || "").trim()).error || detail; } catch {}
           throw new Error(`转换未完成：${detail}`);
-        } finally { fs.rmSync(annotationPath, { force: true }); }
+        } finally { fs.rmSync(annotationPath, { force: true }); fs.rmSync(evidencePath, { force: true }); }
         // Re-read after the long conversion to retain concurrent business edits.
         const latest = readState(), current = latest.exports.find(item => item.id === job.id);
         const latestGate = bundleGate(latest, job.batchId, currentUser);
@@ -1692,11 +1860,27 @@ async function handleApi(req, res, pathname, url) {
       } finally { activeDeliveryConversions.delete(job.id); }
       return true;
     }
+    if (pathname === '/api/exports/verify') {
+      const job = state.exports.find(item => item.id === body.id), target = String(body.format || 'lerobot').toLowerCase();
+      const output = job?.conversions?.[target];
+      if (!job || !output?.archive || job.assetIds.some(id => !visible.assets.some(asset => asset.id === id))) throw new Error('交付包不存在或无权校验');
+      const gate = bundleGate(state, job.batchId, currentUser), fingerprint = deliverySourceFingerprint(state, job);
+      if (!gate?.ready || gate.status !== '已验收' || output.sourceFingerprint !== fingerprint) throw new Error('交付包已失效，请重新转换');
+      const python = findLerobotPython();
+      if (!python) throw new Error('独立校验需要 Python 环境');
+      const { stdout } = await execFileAsync(python, [path.join(root, 'tools', 'verify_delivery.py'), '--archive', output.archive, '--target', target], { timeout: 1800000, maxBuffer: 16 * 1024 * 1024, windowsHide: true });
+      const verification = JSON.parse(stdout);
+      if (!verification.ok || verification.archiveSha256 !== output.archiveSha256) throw new Error('交付包校验失败或整包哈希变化');
+      const latest = readState(), current = latest.exports.find(item => item.id === job.id);
+      if (!current || deliverySourceFingerprint(latest, current) !== fingerprint || current.conversions?.[target]?.archive !== output.archive) throw new Error('校验期间交付版本已变化');
+      current.conversions[target].independentVerification = { ...verification, checkedAt: new Date().toISOString() };
+      writeState(latest); sendJson(res, 200, { ok: true, verification }); return true;
+    }
     if (pathname === "/api/bundles/status") {
       const id = String(body.id || "").trim(), nextStatus = String(body.status || "").trim(), allowed = ["待验收", "已验收", "已归档"];
       if (!id || !allowed.includes(nextStatus)) throw new Error("数据包验收参数无效");
       const gate = bundleGate(state, id, currentUser); if (!gate) { const error = new Error("数据包不存在或当前账号无权访问"); error.status = 404; throw error; }
-      if (!gate.ready) { const error = new Error(`数据包尚未达到验收门禁：分组 ${gate.complete ? "完整" : "不完整"}，视角不完整 Episode ${gate.episodeMediaPending}（缺 ${gate.missingViewCount || 0} 个视角），原始文件 ${gate.originalCount}/${gate.assetCount}，已质检 ${gate.qcCount}/${gate.assetCount}，未关闭问题 ${gate.issueCount}，待审核标注 ${gate.annotationPending || 0}`); error.status = 409; error.extra = { bundle: gate }; throw error; }
+      if (!gate.ready) { const error = new Error(`数据包尚未达到验收门禁：分组 ${gate.complete ? "完整" : "不完整"}，视角不完整 Episode ${gate.episodeMediaPending}（缺 ${gate.missingViewCount || 0} 个视角），原始文件 ${gate.originalCount}/${gate.assetCount}，已质检 ${gate.qcCount}/${gate.assetCount}，缺少当前完整检查证据 ${gate.productionEvidencePending}，未关闭问题 ${gate.issueCount}，待审核标注 ${gate.annotationPending || 0}`); error.status = 409; error.extra = { bundle: gate }; throw error; }
       const transitions = { "可提交验收": ["待验收"], "待验收": ["已验收"], "已验收": ["已归档"], "已归档": [] };
       if (!(transitions[gate.status] || []).includes(nextStatus)) { const error = new Error(`批次不能从“${gate.status}”再次变更为“${nextStatus}”`); error.status = 409; error.extra = { currentStatus: gate.status, nextStatus }; throw error; }
       if (nextStatus === "已验收" && !isAdministrator(currentUser)) { const error = new Error("只有数据治理负责人可以签署批次验收"); error.status = 403; throw error; }
@@ -1724,9 +1908,23 @@ async function handleApi(req, res, pathname, url) {
     }
     if (pathname === "/api/assets") {
       if (!body.name || !body.id || !DATA_TYPES.includes(body.type)) throw new Error("资产编号、名称和数据类型不能为空");
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(body.id)) throw new Error('资产编号包含非法字符');
+      if (body.relativePath) {
+        const relative = String(body.relativePath).replaceAll('\\', '/');
+        if (path.isAbsolute(relative) || relative.split('/').some(part => part === '..' || part === '.')) throw new Error('文件相对路径无效');
+        body.relativePath = relative;
+        if (state.assets.some(asset => asset.id !== body.id && asset.bundleId === body.bundleId && asset.relativePath === relative)) throw new Error('本批次已有同路径文件，请替换已有资产');
+      }
+
       if (body.bundleRole && !["meta", "trajectory", "media"].includes(body.bundleRole)) throw new Error("数据包文件分组无效，必须是 meta、data 或 video");
       assertTypeAllowed(currentUser, body.type);
       const existing = state.assets.find(item => item.id === body.id); if (existing) assertTypeAllowed(currentUser, existing.type);
+      const frozen = state.bundles.find(item => [existing?.bundleId, body.bundleId].includes(item.id) && ["已验收", "已归档"].includes(item.status));
+      if (frozen) { const error = new Error('已验收或归档批次禁止修改资产，请创建修订批次'); error.status = 409; throw error; }
+      if (existing?.bundleId && body.bundleId !== existing.bundleId) throw new Error('已有资产不能移动到其他批次');
+      delete body.isDemo;
+      body.inspection = { ...(body.inspection || {}), production: existing?.inspection?.production, lerobotSchema: existing?.inspection?.lerobotSchema, embodied: existing?.inspection?.embodied };
+
       if (body.bundleId && !body.bundleName && !existing?.bundleName) throw new Error("数据包资产必须带有数据包名称");
       if (body.taskId) { const task = state.tasks.find(item => item.id === body.taskId); if (!task) throw new Error("关联采集任务不存在"); if (task.type !== body.type) throw new Error(`采集任务仅接收 ${task.type} 数据`); if (["待验收", "已完成"].includes(task.status)) throw new Error("待验收或已完成任务不能继续接收资产"); body.taskName = task.name; }
       // Preserve legacy node metadata during file replacement; validate only an actual node change.
@@ -1861,18 +2059,18 @@ async function handleApi(req, res, pathname, url) {
       assertTypeAllowed(currentUser, type);
       const existing = state.nodes.find(item => item.id === id), now = new Date().toISOString(), node = { ...existing, id, type, site, agentVersion: String(body.agentVersion || existing?.agentVersion || "未上报"), capacityGb: Math.max(0, Number(body.capacityGb || existing?.capacityGb || 0)), lastHeartbeat: existing?.lastHeartbeat || null, latency: existing?.latency ?? null, disk: existing?.disk ?? null, queue: existing?.queue ?? 0, createdAt: existing?.createdAt || now, updatedAt: now };
       mergeRecord(state.nodes, node); let agentToken = null; if (!existing && !auth.nodeCredentials.some(item => item.nodeId === id)) agentToken = createNodeCredential(auth, id).token;
-      audit(state, existing ? "更新采集节点" : "登记采集节点", id, `${type} · ${site} · Agent ${node.agentVersion}`, body.user || "林晓雯"); writeAuth(auth); writeState(state); sendJson(res, 201, { ok: true, node: deriveNodeStatus(node), nodes: state.nodes.filter(item => typeAllowed(currentUser, item.type)).map(deriveNodeStatus), agentToken }); return true;
+      audit(state, existing ? "更新采集节点" : "登记采集节点", id, `${type} · ${site} · Agent ${node.agentVersion}`, body.user || "林晓雯"); writeAccounts(auth, state); sendJson(res, 201, { ok: true, node: deriveNodeStatus(node), nodes: state.nodes.filter(item => typeAllowed(currentUser, item.type)).map(deriveNodeStatus), agentToken }); return true;
     }
     if (pathname === "/api/nodes/token") {
       const node = state.nodes.find(item => item.id === String(body.id || "").trim().toUpperCase()); if (!node) throw new Error("采集节点不存在"); assertTypeAllowed(currentUser, node.type);
-      const agentToken = createNodeCredential(auth, node.id).token; audit(state, "轮换节点凭证", node.id, "旧节点令牌已立即失效", currentUser.name); writeAuth(auth); writeState(state); sendJson(res, 200, { ok: true, node: deriveNodeStatus(node), agentToken }); return true;
+      const agentToken = createNodeCredential(auth, node.id).token; audit(state, "轮换节点凭证", node.id, "旧节点令牌已立即失效", currentUser.name); writeAccounts(auth, state); sendJson(res, 200, { ok: true, node: deriveNodeStatus(node), agentToken }); return true;
     }
     if (pathname === "/api/nodes/heartbeat") {
       const node = state.nodes.find(item => item.id === String(body.id || "").toUpperCase()); if (!node) throw new Error("采集节点不存在");
       if (currentUser.isNodeCredential && currentUser.nodeId !== node.id) { const error = new Error("节点凭证与上报节点不匹配"); error.status = 403; throw error; }
       assertTypeAllowed(currentUser, node.type);
       const clamp = (value, min, max, fallback) => { const number = Number(value); return Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : fallback; };
-      Object.assign(node, { lastHeartbeat: new Date().toISOString(), latency: clamp(body.latency, 0, 60000, node.latency), disk: clamp(body.disk, 0, 100, node.disk), queue: clamp(body.queue, 0, 1000000, node.queue || 0), agentVersion: String(body.agentVersion || node.agentVersion || "未上报"), updatedAt: new Date().toISOString() }); if (nodeCredential) { nodeCredential.credential.lastUsedAt = node.lastHeartbeat; writeAuth(auth); } audit(state, "接收节点心跳", node.id, `延迟 ${node.latency ?? "--"} ms · 磁盘 ${node.disk ?? "--"}% · 队列 ${node.queue}`, body.user || "节点代理"); writeState(state); sendJson(res, 200, { ok: true, node: deriveNodeStatus(node), nodes: state.nodes.filter(item => typeAllowed(currentUser, item.type)).map(deriveNodeStatus) }); return true;
+      Object.assign(node, { lastHeartbeat: new Date().toISOString(), latency: clamp(body.latency, 0, 60000, node.latency), disk: clamp(body.disk, 0, 100, node.disk), queue: clamp(body.queue, 0, 1000000, node.queue || 0), agentVersion: String(body.agentVersion || node.agentVersion || "未上报"), updatedAt: new Date().toISOString() }); if (nodeCredential) { nodeCredential.credential.lastUsedAt = node.lastHeartbeat; } audit(state, "接收节点心跳", node.id, `延迟 ${node.latency ?? "--"} ms · 磁盘 ${node.disk ?? "--"}% · 队列 ${node.queue}`, body.user || "节点代理"); writeAccounts(auth, state); sendJson(res, 200, { ok: true, node: deriveNodeStatus(node), nodes: state.nodes.filter(item => typeAllowed(currentUser, item.type)).map(deriveNodeStatus) }); return true;
     }
     if (pathname === "/api/nodes/diagnose") {
       const nodes = state.nodes.filter(node => typeAllowed(currentUser, node.type)).map(deriveNodeStatus), warnings = nodes.flatMap(node => [node.status === "离线" ? `${node.id} 心跳超时` : null, Number(node.disk) >= 85 ? `${node.id} 磁盘使用率 ${node.disk}%` : null, Number(node.latency) >= 200 ? `${node.id} 上行延迟 ${node.latency} ms` : null].filter(Boolean)); audit(state, "运行节点诊断", `${currentUser.domain}采集节点`, warnings.length ? warnings.join("；") : `${nodes.length} 个节点未发现预警`, currentUser.name); writeState(state); sendJson(res, 200, { ok: true, nodes, warnings }); return true;
@@ -1890,7 +2088,7 @@ async function handleApi(req, res, pathname, url) {
       let credentials = authUser;
       if (!credentials) { const record = hashPassword(validatePassword(password)); credentials = { id, name, email, role, domain, status: member.status, canDeleteData, isPlatformOwner: id === auth.ownerId, passwordSalt: record.salt, passwordHash: record.hash, sessionVersion: 1, createdAt: now, updatedAt: now }; auth.users.push(credentials); }
       else { Object.assign(credentials, { name, email, role, domain, status: member.status, canDeleteData, isPlatformOwner: id === auth.ownerId, updatedAt: now }); if (password) { const record = hashPassword(validatePassword(password)); Object.assign(credentials, { passwordSalt: record.salt, passwordHash: record.hash, sessionVersion: Number(credentials.sessionVersion || 1) + 1 }); } }
-      mergeRecord(state.members, member); audit(state, existing ? "更新成员账号" : "创建成员账号", member.id, `${member.name} · ${member.role} · ${member.domain}`, currentUser.name); writeAuth(auth); writeState(state); sendJson(res, 201, { ok: true, member, members: state.members, rolePolicies: ROLE_POLICIES, authMode: "local" }); return true;
+      mergeRecord(state.members, member); audit(state, existing ? "更新成员账号" : "创建成员账号", member.id, `${member.name} · ${member.role} · ${member.domain}`, currentUser.name); writeAccounts(auth, state); sendJson(res, 201, { ok: true, member, members: state.members, rolePolicies: ROLE_POLICIES, authMode: "local" }); return true;
     }
     if (pathname === "/api/members/delete-permission") {
       if (currentUser.id !== auth.ownerId) { const error = new Error("只有平台所有者可以开通或收回删除数据权限"); error.status = 403; throw error; }
@@ -1898,16 +2096,16 @@ async function handleApi(req, res, pathname, url) {
       if (!member || !account) throw new Error("成员账号不存在");
       if (account.id === auth.ownerId && body.canDeleteData !== true) throw new Error("平台所有者必须保留删除数据权限");
       const enabled = body.canDeleteData === true; account.canDeleteData = enabled; member.canDeleteData = enabled; member.updatedAt = new Date().toISOString(); account.updatedAt = member.updatedAt;
-      audit(state, enabled ? "开通删除数据权限" : "收回删除数据权限", member.id, `${member.name} · ${member.email}`, currentUser.name); writeAuth(auth); writeState(state); sendJson(res, 200, { ok: true, member, members: state.members }); return true;
+      audit(state, enabled ? "开通删除数据权限" : "收回删除数据权限", member.id, `${member.name} · ${member.email}`, currentUser.name); writeAccounts(auth, state); sendJson(res, 200, { ok: true, member, members: state.members }); return true;
     }
     if (pathname === "/api/members/status") {
       const member = state.members.find(item => item.id === body.id), allowed = ["待激活", "正常", "已停用"]; if (!member) throw new Error("成员记录不存在"); if (!allowed.includes(body.status)) throw new Error("成员状态无效"); if (member.id === currentUser.id && body.status !== "正常") throw new Error("不能停用当前登录账号");
       const account = auth.users.find(item => item.id === member.id); if (!account) throw new Error("成员尚未创建登录账号");
       member.status = body.status; member.updatedAt = new Date().toISOString(); account.status = body.status; account.updatedAt = member.updatedAt; if (body.status !== "正常") account.sessionVersion = Number(account.sessionVersion || 1) + 1;
-      audit(state, "更新成员状态", member.id, `${member.name} · ${member.status}`, currentUser.name); writeAuth(auth); writeState(state); sendJson(res, 200, { ok: true, member, members: state.members }); return true;
+      audit(state, "更新成员状态", member.id, `${member.name} · ${member.status}`, currentUser.name); writeAccounts(auth, state); sendJson(res, 200, { ok: true, member, members: state.members }); return true;
     }
     if (pathname === "/api/notifications/read") { state.notificationsReadAt = new Date().toISOString(); writeState(state); sendJson(res, 200, { ok: true, notificationsReadAt: state.notificationsReadAt }); return true; }
-    if (pathname === "/api/qc/run") { const batch = runQc(state, body, currentUser); writeState(state); sendJson(res, 201, { ok: true, batch, runs: state.runs, assets: state.assets.filter(item => !item.isDemo && typeAllowed(currentUser, item.type)), issues: state.issues.filter(item => isProductionLinkedRecord(state, item) && typeAllowed(currentUser, item.type)) }); return true; }
+    if (pathname === "/api/qc/run") { const ids = selectQcTargets(state, body.scope, body.model, body.targetIds).filter(asset => typeAllowed(currentUser, asset.type)).map(asset => asset.id); await inspectProductionAssets(state, ids, req.progress); const batch = runQc(state, body, currentUser, operationStartedAt); writeState(state); sendJson(res, 201, { ok: true, batch, runs: state.runs, assets: state.assets.filter(item => !item.isDemo && typeAllowed(currentUser, item.type)), issues: state.issues.filter(item => isProductionLinkedRecord(state, item) && typeAllowed(currentUser, item.type)) }); return true; }
     if (pathname === "/api/qc") { sendError(res, 410, "请通过 /api/qc/run 执行服务端质检"); return true; }
     if (pathname === "/api/assets/lerobot-deep-check") {
       const requestedIds = Array.isArray(body.assetIds) ? [...new Set(body.assetIds.map(String))].slice(0, 200) : [];
@@ -1924,7 +2122,7 @@ async function handleApi(req, res, pathname, url) {
       ]));
       const embodiedReports = [];
       for (const [bundleId, bundleAssets] of bundleGroups) {
-        try { embodiedReports.push(await runEmbodiedBundleCheck(bundleId, bundleAssets)); }
+        try { if (findEmbodiedInvocation()) embodiedReports.push(await runEmbodiedBundleCheck(bundleId, bundleAssets)); }
         catch (error) { error.status = error.status || 503; throw error; }
       }
       const embodiedByBundle = new Map(embodiedReports.map(item => [item.bundleId, item]));
@@ -1933,7 +2131,8 @@ async function handleApi(req, res, pathname, url) {
         const embodied = embodiedByBundle.get(asset.bundleId);
         asset.inspection = { ...(asset.inspection || {}), ...(result ? { lerobotSchema: { ...result, checkedAt: new Date().toISOString(), parser: "pyarrow" } } : {}), ...(embodied ? { embodied } : {}) };
       });
-      const batch = runQc(state, { scope: "LeRobot 深度校验", template: body.template || "标准质检", model: "全部模型", targetIds: targets.map(asset => asset.id) }, currentUser);
+      await inspectProductionAssets(state, targets.map(asset => asset.id), req.progress);
+      const batch = runQc(state, { scope: "LeRobot 深度校验", template: body.template || "标准质检", model: "全部模型", targetIds: targets.map(asset => asset.id) }, currentUser, operationStartedAt);
       audit(state, "执行 LeRobot 深度校验", batch.id, `${targets.length} 个 Parquet · ${embodiedReports.length} 个数据包经 Embodied Data 插件复核 · ${report.files.filter(item => item.status === "verified").length} 个字段通过 · ${report.files.filter(item => item.status !== "verified").length} 个结构异常`, currentUser.name);
       writeState(state);
       sendJson(res, 200, { ok: true, report, embodied: embodiedReports, batch, runs: state.runs, assets: state.assets.filter(item => !item.isDemo && typeAllowed(currentUser, item.type)), issues: state.issues.filter(item => isProductionLinkedRecord(state, item) && typeAllowed(currentUser, item.type)) });
@@ -1941,6 +2140,21 @@ async function handleApi(req, res, pathname, url) {
     }
     if (pathname === "/api/audit") { audit(state, `客户端事件：${String(body.action || "操作").slice(0, 80)}`, String(body.target || "").slice(0, 160), String(body.detail || "").slice(0, 500), currentUser.name); writeState(state); sendJson(res, 201, { ok: true }); return true; }
     if (pathname === "/api/episode-tags") { if (!body.episodeId || !Array.isArray(body.tags)) throw new Error("Episode 标签参数无效"); const assetId = String(body.episodeId).replace(/^EP-/, ""), asset = state.assets.find(item => item.id === assetId); if (asset) assertTypeAllowed(currentUser, asset.type); state.episodeTags[body.episodeId] = [...new Set(body.tags.map(String))]; writeState(state); sendJson(res, 201, { ok: true, episodeId: body.episodeId, tags: state.episodeTags[body.episodeId] }); return true; }
+    if (pathname === "/api/issues/review-media") {
+      const issue = state.issues.find(item => item.id === body.id && item.status !== '已关闭');
+      const asset = state.assets.find(item => item.id === issue?.assetId), production = asset?.inspection?.production;
+      if (!asset || !hasProductionEvidence(asset)) throw new Error('请先完成当前文件的服务端检查');
+      assertTypeAllowed(currentUser, asset.type);
+      if (!hasPermission(currentUser, ['运行质检', '平台设置'])) { sendError(res, 403, '仅质量工程师或负责人可复核媒体候选'); return true; }
+      const findings = production.media?.findings || [], note = String(body.note || '').trim();
+      if (!findings.some(item => ['black_frames', 'frozen_frames'].includes(item.code))) throw new Error('该问题不是可人工复核的黑屏或静止候选');
+      if (note.length < 10) throw new Error('请填写至少 10 字的查看范围与判定依据');
+      if (await backupTools.digest(path.join(uploadDir, asset.serverFile.storedName)) !== production.sha256) throw new Error('源文件已变化，需重新检查');
+      production.mediaReview = { approved: true, sha256: production.sha256, reviewer: currentUser.name, reviewerId: currentUser.id, note, reviewedAt: new Date().toISOString() };
+      const batch = runQc(state, { scope: '媒体人工复核', targetIds: [asset.id] }, currentUser);
+      audit(state, '人工复核媒体候选', asset.id, note, currentUser.name); writeState(state);
+      sendJson(res, 200, { ok: true, batch }); return true;
+    }
     if (pathname === "/api/issues/recheck") {
       const requested = Array.isArray(body.issueIds) && body.issueIds.length ? new Set(body.issueIds.map(String)) : null;
       const visibleOpen = state.issues.filter(issue => issue.status !== "已关闭" && isProductionLinkedRecord(state, issue) && (!requested || requested.has(issue.id)) && typeAllowed(currentUser, issue.type));
@@ -1963,7 +2177,8 @@ async function handleApi(req, res, pathname, url) {
           }
         }
       }
-      const batch = runQc(state, { scope: "问题自动复核", template: body.template || "标准质检", model: "全部模型", targetIds }, currentUser);
+      await inspectProductionAssets(state, targetIds, req.progress);
+      const batch = runQc(state, { scope: "问题自动复核", template: body.template || "标准质检", model: "全部模型", targetIds }, currentUser, operationStartedAt);
       const results = [];
       visibleOpen.forEach(issue => {
         const asset = state.assets.find(item => item.id === issue.assetId);
@@ -2010,7 +2225,7 @@ async function handleApi(req, res, pathname, url) {
     if (pathname === "/api/storage/reconcile") {
       const report = reconcileStorage(state); audit(state, "运行存储一致性校验", "uploads", `引用 ${report.referencedFiles} · 缺失 ${report.missing.length} · 大小不一致 ${report.sizeMismatch.length} · 孤儿 ${report.orphan.length}`, currentUser.name); writeState(state); sendJson(res, 200, { ok: true, report }); return true;
     }
-    if (pathname === "/api/backup") { const stamp = new Date().toISOString().replace(/[:.]/g, "-"), stateTarget = path.join(backupDir, `state-${stamp}.json`), authTarget = path.join(backupDir, `auth-${stamp}.json`); writeState(state); writeAuth(auth); fs.copyFileSync(stateFile, stateTarget); fs.copyFileSync(authFile, authTarget); sendJson(res, 201, { ok: true, backup: path.basename(stateTarget), authBackup: path.basename(authTarget), note: "状态与认证快照已创建；原始文件继续保存在 uploads 目录" }); return true; }
+    if (pathname === "/api/backup") { const backupResult = await backupTools.backup(getStore(), req.progress); sendJson(res, 201, { ok: true, backup: backupResult.backup, backupResult }); return true; }
     sendError(res, 404, "接口不存在"); return true;
   } catch (error) { sendError(res, error.status || 400, error.message || "请求失败", error.extra || {}); return true; }
 }
@@ -2018,21 +2233,25 @@ async function handleApi(req, res, pathname, url) {
 ensureStorage();
 const startupState = readState();
 const createdEpisodeTasks = generateAnnotationTasks(startupState, "系统迁移");
+const reopenedLegacyBatches = reopenAcceptance(startupState, new Set(startupState.assets.filter(asset => !hasProductionEvidence(asset)).map(asset => asset.bundleId)), '升级后缺少绑定当前文件的完整检查证据，请执行完整质检并重新验收');
 const rebuiltExportManifests = rebuildLegacyExportManifests(startupState);
-if (createdEpisodeTasks.length || rebuiltExportManifests) {
+if (createdEpisodeTasks.length || rebuiltExportManifests || reopenedLegacyBatches) {
   const backupName = `state-before-startup-migration-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
-  fs.copyFileSync(stateFile, path.join(backupDir, backupName));
+  fs.writeFileSync(path.join(backupDir, backupName), JSON.stringify(startupState, null, 2));
   writeState(startupState);
   console.log(`启动迁移完成：新增 ${createdEpisodeTasks.length} 个 Episode 标注任务，重建 ${rebuiltExportManifests} 份旧交付清单，原状态备份：${backupName}`);
 }
+taskQueue = new TaskQueue(getStore(), executeQueuedJob);
+taskQueue.schedule();
 const server = http.createServer(async (req, res) => {
+  try {
   let url; try { url = new URL(req.url, `http://${req.headers.host || "localhost"}`); } catch { sendError(res, 400, "非法 URL"); return; }
   const pathname = decodeURIComponent(url.pathname);
   if (pathname === "/health") {
     ensureStorage();
     const state = readState(), auth = readAuth(), productionAssets = state.assets.filter(item => !item.isDemo), productionIds = new Set(productionAssets.map(item => item.id)), gate = exportGate(state), nodes = state.nodes.map(deriveNodeStatus), bundles = bundleList(state), bundlePending = bundles.filter(item => ["可提交验收", "待验收"].includes(item.status)).length, bundleAccepted = bundles.filter(item => item.status === "已验收").length;
     const embodiedPlugin = findEmbodiedInvocation();
-    sendJson(res, 200, { ok: true, service: "embodied-data-quality", version: "2.14.0", port, storage: "server", uploadMode: "stream", importRollback: "enabled", storageReconcile: "enabled", qcEngine: "evidence-v3-embodied", embodiedPlugin: embodiedPlugin ? "available" : "missing", annotationUnit: "task-or-bundle", deliveryUnit: "episode-with-views", deliveryFormat: "LeRobot v2.1", deliveryFormats: ["LeRobot v2.1", "MCAP JSON + original videos", "Zarr v2"], deliveryConversion: "materialized-and-validated", manifestPolicy: "one-per-batch", pipelineTemplate: "V6", pipelineV5Enabled: false, pipelineNodes: V6_WORKFLOW_GROUPS.reduce((sum, group) => sum + group.nodes.length, 0), engineOperators: engineOperatorCatalog(embodiedPlugin).map(item => ({ id: item.id, status: item.status })), workflowStages: WORKFLOW_STAGES.map(item => item.id), issueClosure: "server-evidence-required", productionWorkflow: "task-asset-acceptance", authMode: "local", accessControl: "role-domain-and-owner-grants", setupRequired: auth.users.length === 0, accounts: auth.users.length, assets: productionAssets.length, demoAssets: state.assets.length - productionAssets.length, tasks: state.tasks.length, tasksPendingAcceptance: state.tasks.filter(item => item.status === "待验收").length, bundles: bundles.length, bundlesPendingAcceptance: bundlePending, bundlesAccepted: bundleAccepted, annotations: state.annotations.filter(item => !item.assetId || productionIds.has(item.assetId)).length, exports: state.exports.length, datasets: state.datasets.length, trainingJobs: state.trainingJobs.length, feedbackSamples: state.feedbackSamples.reduce((sum, item) => sum + Number(item.count || 0), 0), nodes: nodes.length, nodesOnline: nodes.filter(item => item.status === "在线").length, members: state.members.length, exportEligible: gate.eligible.length, issuesOpen: state.issues.filter(item => item.status !== "已关闭" && (!item.assetId || productionIds.has(item.assetId))).length, rulesEnabled: state.rules.filter(item => item.enabled !== false).length });
+    sendJson(res, 200, { ok: true, service: "embodied-data-quality", version: "3.0.0", port, storage: "sqlite-wal", uploadMode: "resumable-chunks", importRollback: "resume-preserving-uploaded-files", backgroundTasks: "durable-single-worker", storageReconcile: "enabled", qcEngine: "evidence-v3-embodied", embodiedPlugin: embodiedPlugin ? "available" : "missing", annotationUnit: "task-or-bundle", deliveryUnit: "episode-with-views", deliveryFormat: "LeRobot v2.1", deliveryFormats: ["LeRobot v2.1", "MCAP JSON + original videos", "Zarr v2"], deliveryConversion: "materialized-and-validated", manifestPolicy: "one-per-batch", pipelineTemplate: "V6", pipelineV5Enabled: false, pipelineNodes: V6_WORKFLOW_GROUPS.reduce((sum, group) => sum + group.nodes.length, 0), engineOperators: engineOperatorCatalog(embodiedPlugin).map(item => ({ id: item.id, status: item.status })), workflowStages: WORKFLOW_STAGES.map(item => item.id), issueClosure: "server-evidence-required", productionWorkflow: "task-asset-acceptance", authMode: "local", accessControl: "role-domain-and-owner-grants", setupRequired: auth.users.length === 0, accounts: auth.users.length, assets: productionAssets.length, demoAssets: state.assets.length - productionAssets.length, tasks: state.tasks.length, tasksPendingAcceptance: state.tasks.filter(item => item.status === "待验收").length, bundles: bundles.length, bundlesPendingAcceptance: bundlePending, bundlesAccepted: bundleAccepted, annotations: state.annotations.filter(item => !item.assetId || productionIds.has(item.assetId)).length, exports: state.exports.length, datasets: state.datasets.length, trainingJobs: state.trainingJobs.length, feedbackSamples: state.feedbackSamples.reduce((sum, item) => sum + Number(item.count || 0), 0), nodes: nodes.length, nodesOnline: nodes.filter(item => item.status === "在线").length, members: state.members.length, exportEligible: gate.eligible.length, issuesOpen: state.issues.filter(item => item.status !== "已关闭" && (!item.assetId || productionIds.has(item.assetId))).length, rulesEnabled: state.rules.filter(item => item.enabled !== false).length });
     return;
   }
   if (await handleApi(req, res, pathname, url)) return;
@@ -2041,11 +2260,12 @@ const server = http.createServer(async (req, res) => {
   const requestPath = pathname === "/" ? "/index.html" : pathname, file = path.resolve(root, "." + requestPath);
   if (!file.startsWith(path.resolve(root) + path.sep)) { res.writeHead(403); res.end("forbidden"); return; }
   fs.readFile(file, (error, data) => { if (error) { res.writeHead(404); res.end("not found"); return; } res.writeHead(200, { "Content-Type": mime[path.extname(file).toLowerCase()] || "application/octet-stream", "Cache-Control": "no-store" }); res.end(data); });
+  } catch (error) { console.error(error.stack); if (!res.headersSent) sendError(res, error.status || 503, error.message || "平台存储或服务异常"); else res.destroy(); }
 });
 server.listen(port, host, () => {
   const lan = Object.values(os.networkInterfaces()).flat().filter(item => item && item.family === "IPv4" && !item.internal).map(item => item.address);
-  console.log("========================================"); console.log("具身数据质量管控平台 v2.14 已启动  " + new Date().toLocaleString("zh-CN")); console.log("  本机访问：http://localhost:" + port); lan.forEach(address => console.log("  局域网访问：http://" + address + ":" + port)); console.log("  生产闭环：任务 → 资产 → 质检 → 验收"); console.log("  流程模板：V6（V5 已停用）"); console.log("  标注单位：采集任务 / 数据集（指令审核一次）"); console.log("  交付单位：Episode（多视角合并，一批一清单）"); console.log("  交付格式：LeRobot v2.1（物化目录 + 校验证据）"); console.log("  问题关闭：服务端证据复检"); console.log("  质量引擎：Embodied Data · LeRobot bundle check"); console.log("  访问控制：角色权限 + 数据域隔离 + 所有者授权"); console.log("  流式上传目录：" + uploadDir); console.log("========================================");
+  console.log("========================================"); console.log("具身数据质量管控平台 v3.0 已启动  " + new Date().toLocaleString("zh-CN")); console.log("  本机访问：http://localhost:" + port); lan.forEach(address => console.log("  局域网访问：http://" + address + ":" + port)); console.log("  生产闭环：任务 → 资产 → 质检 → 验收"); console.log("  流程模板：V6（V5 已停用）"); console.log("  标注单位：采集任务 / 数据集（指令审核一次）"); console.log("  交付单位：Episode（多视角合并，一批一清单）"); console.log("  交付格式：LeRobot v2.1（物化目录 + 校验证据）"); console.log("  问题关闭：服务端证据复检"); console.log("  质量引擎：Embodied Data · LeRobot bundle check"); console.log("  访问控制：角色权限 + 数据域隔离 + 所有者授权"); console.log("  流式上传目录：" + uploadDir); console.log("========================================");
   reconcileLeRobotDeliveries().then(changed => { if (changed) console.log(`已补齐 ${changed} 份 LeRobot 交付目录`); }).catch(error => console.warn(`LeRobot 交付目录对账失败：${error.message}`));
 });
 server.on("error", error => { console.error(error.code === "EADDRINUSE" ? `端口 ${port} 已被占用。` : "服务监听异常：" + error.message); process.exitCode = 1; });
-process.on("uncaughtException", error => console.error("服务异常：" + error.stack));
+process.on("uncaughtException", error => { console.error("服务异常：" + error.stack); process.exit(1); });

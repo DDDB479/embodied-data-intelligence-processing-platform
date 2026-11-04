@@ -19,7 +19,7 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
 
 
-def convert(source, output, target, annotations):
+def convert(source, output, target, annotations, evidence=None):
     import numpy as np
     import pyarrow.parquet as pq
 
@@ -150,6 +150,19 @@ def convert(source, output, target, annotations):
         (staging / 'meta' / 'info.json').write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding='utf-8')
         report = {'ok': True, 'format': target, 'schema': 'embodied-json' if target == 'mcap' else 'zarr-v2-columns' if target == 'zarr' else 'lerobot-v2', 'episodes': len(files), 'frames': rows_total, 'media': media, 'sourceFiles': source_hashes, 'validation': 'round-trip-all-columns-and-media-sha256', 'videoMode': 'original-files-with-relative-references', 'rosCompatible': False}
         (staging / 'conversion-report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+        if evidence:
+            shutil.copyfile(evidence, staging / 'acceptance-evidence.json')
+        shutil.copyfile(Path(__file__).with_name('read_delivery.py'), staging / 'read_delivery.py')
+        (staging / 'DELIVERY.md').write_text(
+            '# Delivery contract\n\n'
+            f'Format: {target}. LeRobot source layout: v2.x.\n\n'
+            'MCAP uses embodied-json messages with episode-relative timestamps in nanoseconds; it is not a ROS bag. '
+            'Zarr uses per-episode column arrays and column_encodings metadata. Original videos remain separate files.\n\n'
+            'Run `python read_delivery.py <unpacked-directory>` to read a sample. '
+            'Install the dependencies listed by the platform. This example does not certify compatibility with a target training framework.\n', encoding='utf-8')
+        inventory = [{'path': file.relative_to(staging).as_posix(), 'sha256': digest(file), 'bytes': file.stat().st_size}
+                     for file in sorted(staging.rglob('*')) if file.is_file()]
+        (staging / 'delivery-inventory.json').write_text(json.dumps({'version': 1, 'files': inventory}, indent=2), encoding='utf-8')
         archive = output.with_suffix('.zip')
         with zipfile.ZipFile(archive, 'x', compression=zipfile.ZIP_STORED, allowZip64=True) as package:
             for file in sorted(staging.rglob('*')):
@@ -173,9 +186,10 @@ if __name__ == '__main__':
     parser.add_argument('--output', required=True)
     parser.add_argument('--target', choices=['lerobot', 'mcap', 'zarr'], required=True)
     parser.add_argument('--annotations', required=True)
+    parser.add_argument('--evidence')
     args = parser.parse_args()
     try:
-        print(json.dumps(convert(args.source, args.output, args.target, args.annotations), ensure_ascii=True))
+        print(json.dumps(convert(args.source, args.output, args.target, args.annotations, args.evidence), ensure_ascii=True))
     except Exception as error:
         print(json.dumps({'ok': False, 'error': str(error)}, ensure_ascii=True))
         raise SystemExit(1)

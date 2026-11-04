@@ -21,7 +21,7 @@ test('V6 converts one accepted batch to three verified downloadable formats', { 
       const relativePath = name.replaceAll('\\', '/'), filename = path.basename(name), data = fs.readFileSync(path.join(source, name));
       const storedName = `asset-${index}.bin`; fs.writeFileSync(path.join(uploads, storedName), data);
       const role = relativePath.startsWith('data/') ? 'trajectory' : relativePath.startsWith('videos/') ? 'media' : 'meta';
-      return { id: `AST-${index}`, name: filename, bundleId: 'B-DELIVERY', bundleName: 'test-batch', bundleRole: role, relativePath, type: '遥操', format: path.extname(name).slice(1).toUpperCase(), status: '已通过', score: 100, lastQcAt: new Date().toISOString(), serverFile: { storedName, size: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex') }, ...(role === 'trajectory' ? { inspection: { lerobotSchema: { status: 'verified', issues: [] } } } : {}) };
+      return { id: `AST-${index}`, name: filename, bundleId: 'B-DELIVERY', bundleName: 'test-batch', bundleRole: role, relativePath, type: '遥操', format: path.extname(name).slice(1).toUpperCase(), status: '已通过', score: 100, lastQcAt: new Date().toISOString(), serverFile: { storedName, size: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex') }, inspection: { production: { sha256: crypto.createHash('sha256').update(data).digest('hex') }, ...(role === 'trajectory' ? { lerobotSchema: { status: 'verified', issues: [] } } : {}) } };
     });
     fs.writeFileSync(path.join(dir, 'server-state.json'), JSON.stringify({ assets, bundles: [{ id: 'B-DELIVERY', status: '已验收', gateVersion: 'episode-v2' }], annotationStandards: { 'B-DELIVERY': { instruction: 'approved task', status: '已通过', reviewedAt: new Date().toISOString(), reviewer: 'QA' } } }));
     const listener = net.createServer(); await new Promise(resolve => listener.listen(0, '127.0.0.1', resolve));
@@ -65,27 +65,29 @@ test('V6 converts one accepted batch to three verified downloadable formats', { 
     assert.equal((await request('POST', '/api/exports/convert', { id, format: 'mcap' }, viewerCookie)).status, 403);
     assert.equal((await request('GET', `/api/exports/${id}/package?format=mcap`, null, viewerCookie)).status, 403);
     // A changed approved instruction invalidates the older downloadable output.
-    const stateFile = path.join(dir, 'server-state.json');
-    const revised = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    const { PlatformStore } = require('../tools/platform-store.cjs');
+    const store = new PlatformStore(dir, {});
+    const revised = store.read('state');
     revised.annotationStandards['B-DELIVERY'].instruction = 'revised approved task';
-    fs.writeFileSync(stateFile, JSON.stringify(revised));
+    store.write('state', revised);
     assert.equal((await request('GET', `/api/exports/${id}/package?format=mcap`, null, cookie)).status, 409);
     assert.equal((await request('GET', '/api/exports', null, cookie)).body.exports[0].conversions.mcap.current, false);
     const regenerated = await request('POST', '/api/exports/convert', { id, format: 'mcap' }, cookie);
     assert.equal(regenerated.status, 201, JSON.stringify(regenerated.body));
     assert.equal((await request('GET', `/api/exports/${id}/package?format=mcap`, null, cookie)).status, 200);
     // Replacing a source file requires rebuilding the canonical delivery snapshot.
-    const replaced = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    const replaced = store.read('state');
     const originalHash = replaced.assets[0].serverFile.sha256;
     replaced.assets[0].serverFile.sha256 = 'changed-source-hash';
-    fs.writeFileSync(stateFile, JSON.stringify(replaced));
+    store.write('state', replaced);
     assert.equal((await request('POST', '/api/exports/convert', { id, format: 'mcap' }, cookie)).status, 409);
     replaced.assets[0].serverFile.sha256 = originalHash;
-    fs.writeFileSync(stateFile, JSON.stringify(replaced));
+    store.write('state', replaced);
+    store.close();
     if (process.env.DELIVERY_UI_PREVIEW === '1') {
       // Test-only proxy exposes this disposable fixture, never production state.
       const preview = http.createServer((req, res) => {
-        const upstream = http.request({ hostname: '127.0.0.1', port, path: req.url, method: req.method, headers: { ...req.headers, host: `127.0.0.1:${port}`, cookie } }, response => { res.writeHead(response.statusCode, response.headers); response.pipe(res); });
+        const upstream = http.request({ hostname: '127.0.0.1', port, path: req.url, method: req.method, headers: { ...req.headers, host: `127.0.0.1:${port}`, ...(req.headers.origin ? { origin: `http://127.0.0.1:${port}` } : {}), cookie } }, response => { res.writeHead(response.statusCode, response.headers); response.pipe(res); });
         upstream.on('error', () => { res.writeHead(502); res.end(); }); req.pipe(upstream);
       });
       await new Promise(resolve => preview.listen(4186, '127.0.0.1', resolve));

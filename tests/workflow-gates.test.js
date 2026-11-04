@@ -15,7 +15,7 @@ function asset(id, role, relativePath) {
   return {
     id, bundleId: 'B-1', bundleName: 'matching_cable8_joint', bundleRole: role,
     relativePath, name: path.basename(relativePath), type: '遥操', status: '已通过',
-    lastQcAt: '2026-10-23T00:00:00.000Z', serverFile: { size: 10, sha256: id },
+    inspection: { production: { sha256: id } }, lastQcAt: '2026-10-23T00:00:00.000Z', serverFile: { size: 10, sha256: id },
   };
 }
 
@@ -188,4 +188,17 @@ test('V6 workflow exposes the main pipeline and marks unconnected algorithms hon
   assert.equal(nodes.find(node => node.id === 'data_merging').status, 'unavailable');
   assert.equal(nodes.find(node => node.id === 'lerobot_v6').status, 'done');
   assert.ok(workflow.unavailableNodes > 0);
+});
+
+
+test('legacy passed flags without current production evidence cannot pass acceptance', () => {
+  const state = fixture();
+  generateAnnotationTasks(state);
+  applyAnnotationStandard(state, { bundleId: 'B-1', action: 'submit', instruction: '插入线缆' }, '标注员');
+  applyAnnotationStandard(state, { bundleId: 'B-1', action: 'approve' }, '审核员');
+  assert.equal(bundleGate(state, 'B-1').ready, true);
+  delete state.assets[0].inspection.production;
+  assert.equal(bundleGate(state, 'B-1').ready, false);
+  assert.equal(bundleGate(state, 'B-1').productionEvidencePending, 1);
+  assert.equal(exportGate(state).eligible.length, 0);
 });

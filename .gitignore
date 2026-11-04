@@ -16,3 +16,8 @@ $null
 Thumbs.db
 .vscode/
 .idea/
+
+# Private transactional database and local backups
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

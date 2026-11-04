@@ -79,7 +79,7 @@ flowchart LR
 
 ### 1. 获取源码并启动
 
-需要 Windows 10/11、Node.js 18+ 和 PowerShell 5.1+。仓库不打包 Node / Python 运行时，首次使用请先安装所需环境。
+需要 Windows 10/11、Node.js 22.13+（推荐 Node.js 24 LTS） 和 PowerShell 5.1+。仓库不打包 Node / Python 运行时，首次使用请先安装所需环境。
 
 ```powershell
 git clone https://github.com/DDDB479/embodied-data-intelligence-processing-platform.git
@@ -156,7 +156,8 @@ node --test tests/*.test.js
 
 - 原始文件、认证状态、质检记录和交付包保存在部署电脑的 `work/` 中；`work/`、`runtime/`、日志和缓存已加入 Git 忽略规则。
 - ZIP 与资产下载经过服务端认证和权限检查，`work/` 与 `.git/` 不作为静态文件公开。
-- 当前采用单机文件与 JSON 状态持久化；多人高并发、数据库事务、容灾与互联网部署仍需专门加固和验证。
+- 当前使用 SQLite WAL 事务保存业务、账号、上传会话和后台任务，原始文件单独落盘；支持完整备份及恢复到空目录。仍是单机部署，尚未验证多实例或高并发负载，互联网部署需单独配置 TLS 与网关。
+- 本轮生产升级、续传、检查依据与恢复步骤见 [生产升级说明](docs/PRODUCTION_UPGRADE.md)。
 - V6 的融合、脱敏、位姿、语义标注等完整算法链路仍待接入。按钮、模板进度或界面截图不等于这些算法已实现。
 
 ## 项目结构

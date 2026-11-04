@@ -2,3 +2,4 @@ pyarrow>=14
 numpy>=1.24
 mcap>=1.1,<2
 zarr>=2.18,<3
+av>=12,<17

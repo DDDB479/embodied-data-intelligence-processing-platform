@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $work = Join-Path $root "work"
 $bundledNode = Join-Path $root "runtime\node.exe"
@@ -11,13 +11,19 @@ $healthUrl = "http://127.0.0.1:4173/health"
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
 if (-not $node -or -not (Test-Path -LiteralPath $node)) {
-  "$(Get-Date -Format s) Node.js runtime is missing. Install Node.js 18+ or provide runtime\node.exe" | Out-File $stderr -Append -Encoding utf8
+  "$(Get-Date -Format s) Node.js runtime is missing. Install Node.js 22.13+ or provide runtime\node.exe" | Out-File $stderr -Append -Encoding utf8
   exit 2
 }
 
 if (-not (Test-Path -LiteralPath $server)) {
   "$(Get-Date -Format s) Missing server: $server" | Out-File $stderr -Append -Encoding utf8
   exit 3
+}
+
+$runtimeVersion = & $node -p "Number(process.versions.node.split('.')[0]) >= 22 && !!require('node:sqlite').DatabaseSync" 2>$null
+if ($LASTEXITCODE -ne 0 -or $runtimeVersion -ne "true") {
+  "$(Get-Date -Format s) SQLite requires Node.js 22.13+; use a supported runtime." | Out-File $stderr -Append -Encoding utf8
+  exit 4
 }
 
 function Test-PlatformHealth {

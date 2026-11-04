@@ -37,8 +37,8 @@ function asset(id, role, relativePath) {
   return {
     id, bundleId: 'B-ANNOTATION-API', bundleName: 'matching_cable8_joint', bundleRole: role,
     relativePath, name: path.basename(relativePath), type: '遥操', status: '已通过',
-    lastQcAt: '2026-10-23T00:00:00.000Z', serverFile: { storedName: `${id}.bin`, size: 10, sha256: id },
-    ...(role === 'trajectory' ? { inspection: { lerobotSchema: { status: 'verified', issues: [] } } } : {}),
+    inspection: { production: { sha256: id } }, lastQcAt: '2026-10-23T00:00:00.000Z', serverFile: { storedName: `${id}.bin`, size: 10, sha256: id },
+    ...(role === 'trajectory' ? { inspection: { production: { sha256: id }, lerobotSchema: { status: 'verified', issues: [] } } } : {}),
   };
 }
 

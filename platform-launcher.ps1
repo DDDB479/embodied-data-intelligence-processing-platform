@@ -1,4 +1,4 @@
-param(
+﻿param(
   [switch]$OpenBrowser
 )
 
@@ -29,7 +29,7 @@ function Test-PlatformHealth {
 }
 
 if (-not (Test-Path -LiteralPath $runtime) -and -not (Get-Command node.exe -ErrorAction SilentlyContinue)) {
-  throw "Node.js 18+ is required. Install Node.js or provide runtime\node.exe"
+  throw "Node.js 22.13+ is required. Install Node.js or provide runtime\node.exe"
 }
 
 Clear-KnownPortConflict
@@ -41,7 +41,7 @@ if (-not (Test-PlatformHealth)) {
   if ($task) {
     Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
   } else {
-    Start-Process $powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',$service) -WorkingDirectory $root
+    Start-Process $powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',$service) -WorkingDirectory $root
   }
   for ($attempt = 0; $attempt -lt 20; $attempt++) {
     Start-Sleep -Seconds 1
@@ -51,7 +51,7 @@ if (-not (Test-PlatformHealth)) {
   # Start one foreground supervisor as a fallback; it exits immediately when
   # the task-managed service becomes healthy, so this does not create a second server.
   if (-not (Test-PlatformHealth)) {
-    Start-Process $powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',$service) -WorkingDirectory $root
+    Start-Process $powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',$service) -WorkingDirectory $root
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
       Start-Sleep -Seconds 1
       if (Test-PlatformHealth) { break }
