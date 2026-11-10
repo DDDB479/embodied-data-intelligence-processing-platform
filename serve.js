@@ -439,7 +439,7 @@ function defaultRules() {
 function defaultSettings() {
   return { thresholds: { "快速质检": 85, "标准质检": 90, "全量质检": 93, "仅同步检测": 90 }, video: { minWidth: 640, minHeight: 480, blackMeanMax: 8, blackRatioMax: 0.95, freezeDifferenceMax: 0.15, freezeRatioMax: 0.98, durationToleranceSeconds: 0.1 }, issueWeights: { high: 35, medium: 8 } };
 }
-function defaultState() { return { assets: [], tasks: [], qcBatches: [], runs: [], audit: [], episodeTags: {}, issues: [], annotations: [], annotationStandards: {}, exports: [], datasets: [], trainingJobs: [], feedbackSamples: [], nodes: [], members: [], bundles: [], notificationsReadAt: null, rules: defaultRules(), settings: defaultSettings() }; }
+function defaultState() { return { assets: [], tasks: [], qcBatches: [], runs: [], audit: [], episodeTags: {}, issues: [], annotations: [], annotationStandards: {}, exceptionReviews: [], exports: [], datasets: [], trainingJobs: [], feedbackSamples: [], nodes: [], members: [], bundles: [], notificationsReadAt: null, rules: defaultRules(), settings: defaultSettings() }; }
 function ensureStorage() {
   fs.mkdirSync(uploadDir, { recursive: true });
   fs.mkdirSync(backupDir, { recursive: true });
@@ -479,6 +479,7 @@ function readState() {
     state.nodes = (Array.isArray(state.nodes) ? state.nodes : []).map(deriveNodeStatus);
     state.members = Array.isArray(state.members) ? state.members : [];
     state.issues = Array.isArray(state.issues) ? state.issues : [];
+    state.exceptionReviews = Array.isArray(state.exceptionReviews) ? state.exceptionReviews : [];
     const legacyAnnotations = state.annotations.filter(item => !isCurrentAnnotation(state, item));
     state.legacyAnnotations = [...(Array.isArray(state.legacyAnnotations) ? state.legacyAnnotations : []), ...legacyAnnotations];
     state.annotations = state.annotations.filter(item => isCurrentAnnotation(state, item)).map(item => ({ ...item, groupKey: annotationGroupKeyForAnnotation(state, item) }));
@@ -621,7 +622,7 @@ function permissionFor(req, pathname) {
     [/^\/api\/datasets(?:\/status)?$/, ["数据集发布"]], [/^\/api\/training\/feedback$/, ["失败样本回流", "训练调度"]],
     [/^\/api\/training(?:\/status)?$/, ["训练调度"]], [/^\/api\/nodes/, ["节点管理"]],
     [/^\/api\/members/, ["成员管理"]], [/^\/api\/qc/, ["运行质检", "资产管理"]], [/^\/api\/issues\/recheck$/, ["运行质检", "问题处置"]],
-    [/^\/api\/episode-tags$/, ["标注审核", "资产管理"]], [/^\/api\/issues\/(update|review-media)$/, ["问题处置"]],
+    [/^\/api\/episode-tags$/, ["标注审核", "资产管理"]], [/^\/api\/issues\/(update|review-media)$/, ["问题处置"]], [/^\/api\/exceptions\/review$/, ["标注审核", "问题处置", "资产管理"]],
     [/^\/api\/rules\//, ["规则管理"]], [/^\/api\/(settings|backup|storage\/reconcile)$/, ["平台设置"]],
   ];
   return rules.find(([pattern]) => pattern.test(pathname))?.[1] || null;
@@ -700,7 +701,8 @@ function scopedState(state, user) {
     const gate = bundleGate(state, job.batchId, user), fingerprint = deliverySourceFingerprint(state, job);
     return { ...job, conversions: Object.fromEntries(Object.entries(job.conversions || {}).map(([format, output]) => [format, { ...output, current: output.ok === true && output.independentVerification?.ok === true && gate?.ready === true && gate.status === "已验收" && output.sourceFingerprint === fingerprint }])) };
   }) : [];
-  return { ...state, assets, tasks, issues, annotations, annotationStandards, annotationGroups, v6Workflows, nodes, qcBatches, runs, datasets, trainingJobs, feedbackSamples, rules, episodeTags, bundles, exports, members: hasPermission(user, ["成员管理"]) ? state.members : [], audit: hasPermission(user, ["成员管理", "平台设置"]) ? state.audit : [] };
+  const exceptionReviews = state.exceptionReviews.filter(review => assetIds.has(review.assetId) && typeAllowed(user, review.type));
+  return { ...state, assets, tasks, issues, annotations, annotationStandards, annotationGroups, exceptionReviews, v6Workflows, nodes, qcBatches, runs, datasets, trainingJobs, feedbackSamples, rules, episodeTags, bundles, exports, members: hasPermission(user, ["成员管理"]) ? state.members : [], audit: hasPermission(user, ["成员管理", "平台设置"]) ? state.audit : [] };
 }
 function loginAttemptKey(req, email) { return `${req.socket.remoteAddress || "unknown"}:${email}`; }
 function checkLoginLimit(key) {
@@ -1151,6 +1153,49 @@ function annotationGroupAnnotations(state, key) {
   return state.annotations.filter(item => isCurrentAnnotation(state, item) && annotationGroupKeyForAnnotation(state, item) === key);
 }
 
+function annotationGroupEpisodeStats(state, key) {
+  const groupAssets = state.assets.filter(asset => !asset.isDemo && annotationGroupKeyForAsset(asset) === key);
+  const episodes = groupAssets.filter(asset => asset.bundleRole === "trajectory" && /episode_\d+\.parquet$/i.test(asset.relativePath || asset.name));
+  const openIssueIds = new Set(state.issues.filter(issue => issue.status !== "已关闭").map(issue => issue.assetId));
+  const openIssueCount = groupAssets.filter(item => openIssueIds.has(item.id)).length;
+  let videoCovered = 0, missingVideoCount = 0, qcPendingCount = 0;
+  episodes.forEach(asset => {
+    const episodeIndex = episodeIndexForAsset(asset), hasVideo = groupAssets.some(item => item.bundleId === asset.bundleId && item.bundleRole === "media" && episodeIndexForAsset(item) === episodeIndex);
+    if (hasVideo) videoCovered++; else missingVideoCount++;
+    if (!asset.lastQcAt || asset.status !== "已通过") qcPendingCount++;
+  });
+  return { episodeCount: episodes.length, videoCovered, missingVideoCount, qcPendingCount, openIssueCount, anomalyCount: missingVideoCount + qcPendingCount + openIssueCount };
+}
+
+function annotationGroupFlow(state, key) {
+  const groupAssets = state.assets.filter(asset => !asset.isDemo && annotationGroupKeyForAsset(asset) === key);
+  const trajectoryAssets = groupAssets.filter(asset => asset.bundleRole === "trajectory"), sourceAssets = trajectoryAssets.length ? trajectoryAssets : groupAssets.filter(asset => asset.bundleRole !== "media");
+  const sourceFormats = [...new Set(sourceAssets.map(asset => {
+    const format = String(asset.format || path.extname(asset.relativePath || asset.name || "").replace(/^\./, "") || "").trim();
+    return format ? format.toUpperCase() : "";
+  }).filter(Boolean))];
+  const bundleIds = new Set(groupAssets.map(asset => asset.bundleId).filter(Boolean));
+  const exportJobs = (state.exports || []).filter(job => bundleIds.has(job.batchId) || (job.batchIds || []).some(id => bundleIds.has(id)));
+  const deliveryFormats = [...new Set(exportJobs.flatMap(job => {
+    const converted = Object.entries(job.conversions || {}).filter(([, output]) => output?.ok).map(([format]) => format.toUpperCase());
+    return converted.length ? converted : [String(job.format || "").replace(/^LeRobot$/i, "LEROBOT v2.1").toUpperCase()];
+  }).filter(Boolean))];
+  return { sourceFormats, source: sourceFormats.join(" + ") || "原始数据", deliveryFormats, delivery: deliveryFormats.join(" + ") || "未生成" };
+}
+
+function annotationGroupSignals(state, key, stats, standard) {
+  const signals = [], status = standard?.status || deriveAnnotationGroupStatus(state, key), flow = annotationGroupFlow(state, key);
+  if (status === "已驳回") signals.push({ key: "rejected", label: "标准已驳回", severity: "high" });
+  if (stats.missingVideoCount) signals.push({ key: "missing-video", label: `缺视频 ${stats.missingVideoCount}`, severity: "high" });
+  if (stats.openIssueCount) signals.push({ key: "open-issues", label: `未关闭问题 ${stats.openIssueCount}`, severity: "high" });
+  if (stats.qcPendingCount) signals.push({ key: "qc-pending", label: `待质检 ${stats.qcPendingCount}`, severity: "medium" });
+  if (status === "待审核") signals.push({ key: "review", label: "标准待审核", severity: "medium" });
+  if (["待标注", "标注中"].includes(status)) signals.push({ key: "standard", label: status === "标注中" ? "标准待提交" : "待配任务标准", severity: "medium" });
+  if (!flow.deliveryFormats.length) signals.push({ key: "delivery", label: "交付格式未生成", severity: "low" });
+  if (!signals.length) signals.push({ key: "ready", label: "队列健康", severity: "low" });
+  return signals;
+}
+
 function deriveAnnotationGroupStatus(state, key) {
   const annotations = annotationGroupAnnotations(state, key);
   if (annotations.length && annotations.every(annotationApproved)) return "已通过";
@@ -1181,6 +1226,10 @@ function annotationGroupList(state, user = null) {
   groups.forEach((group, key) => {
     const annotations = annotationGroupAnnotations(state, key).filter(item => typeAllowed(user, item.type)), standard = annotationStandardFor(state, key);
     group.annotationCount = annotations.length;
+    group.stats = annotationGroupEpisodeStats(state, key);
+    group.flow = annotationGroupFlow(state, key);
+    group.signals = annotationGroupSignals(state, key, group.stats, standard);
+    group.primarySignal = group.signals[0];
     group.status = standard?.status || deriveAnnotationGroupStatus(state, key);
     group.instruction = standard?.instruction || "";
     group.updatedAt = standard?.updatedAt || "";
@@ -1239,6 +1288,24 @@ function applyAnnotationStandard(state, body = {}, user = "系统") {
     updated++;
   });
   return { standard, updated, scope, action, previousStatus: currentStatus, nextStatus };
+}
+
+function submitAnnotationStandards(state, body = {}, user = "系统") {
+  const groupKeys = [...new Set((Array.isArray(body.groupKeys) ? body.groupKeys : []).map(key => String(key || "").trim()).filter(Boolean))];
+  if (!groupKeys.length) throw new Error("请选择至少一个任务或数据集");
+  if (groupKeys.length > 100) throw new Error("一次最多批量提交 100 个任务或数据集");
+  const submitted = [], skipped = [];
+  groupKeys.forEach(key => {
+    const scope = annotationGroupMeta(state, key);
+    if (!scope) { skipped.push({ key, reason: "任务或数据集不存在" }); return; }
+    const currentStatus = state.annotationStandards?.[key]?.status || deriveAnnotationGroupStatus(state, key);
+    if (!ANNOTATION_STANDARD_EDITABLE.includes(currentStatus)) { skipped.push({ key, name: scope.name, reason: `当前状态“${currentStatus}”不能提交` }); return; }
+    const instruction = String(state.annotationStandards?.[key]?.instruction || "").trim();
+    if (!instruction) { skipped.push({ key, name: scope.name, reason: "尚未填写任务指令" }); return; }
+    const result = applyAnnotationStandard(state, { groupKey: key, action: "submit", instruction }, user);
+    submitted.push({ key, name: scope.name, updated: result.updated, status: result.nextStatus });
+  });
+  return { submitted, skipped };
 }
 
 function generateAnnotationTasks(state, user = "系统", domainUser = null) {
@@ -1950,6 +2017,23 @@ async function handleApi(req, res, pathname, url) {
       if (!hasPermission(currentUser, ["标注编辑", "资产管理"])) { const error = new Error("当前账号只能查看标注，不能生成标注任务"); error.status = 403; throw error; }
       const created = generateAnnotationTasks(state, currentUser.name, currentUser), refreshed = scopedState(state, currentUser); writeState(state); sendJson(res, 201, { ok: true, created: created.length, annotations: refreshed.annotations, annotationStandards: refreshed.annotationStandards, annotationGroups: refreshed.annotationGroups }); return true;
     }
+    if (pathname === "/api/annotations/batch") {
+      if (!hasPermission(currentUser, ["标注编辑", "资产管理"])) { const error = new Error("当前账号没有批量提交任务指令的权限"); error.status = 403; throw error; }
+      const groupKeys = [...new Set((Array.isArray(body.groupKeys) ? body.groupKeys : []).map(key => String(key || "").trim()).filter(Boolean))];
+      for (const key of groupKeys) {
+        const scope = annotationGroupMeta(state, key);
+        if (!scope) { const error = new Error(`任务或数据集不存在：${key}`); error.status = 404; throw error; }
+        const scopeAssets = state.assets.filter(item => !item.isDemo && annotationGroupKeyForAsset(item) === scope.key);
+        if (scopeAssets.some(item => !typeAllowed(currentUser, item.type))) { const error = new Error("当前账号无权提交该任务或数据集"); error.status = 403; throw error; }
+      }
+      const result = submitAnnotationStandards(state, { groupKeys }, currentUser.name);
+      if (result.submitted.length) {
+        audit(state, "批量提交任务指令审核", "标注工作台", `提交 ${result.submitted.length} 个范围，跳过 ${result.skipped.length} 个`, currentUser.name);
+        writeState(state);
+      }
+      const refreshed = scopedState(state, currentUser);
+      sendJson(res, 200, { ok: true, ...result, annotations: refreshed.annotations, annotationStandards: refreshed.annotationStandards, annotationGroups: refreshed.annotationGroups }); return true;
+    }
     if (pathname === "/api/annotations/standard") {
       const action = String(body.action || "save").trim(), needsEdit = ["save", "submit", "reopen"].includes(action), needsReview = ["approve", "reject"].includes(action);
       const scope = resolveAnnotationGroup(state, body);
@@ -1976,6 +2060,29 @@ async function handleApi(req, res, pathname, url) {
       const actionLabel = { save: "保存标注草稿", submit: "提交标注审核", approve: "标注审核通过", reject: "退回标注修改", reopen: "重新打开标注" }[action];
       audit(state, actionLabel, annotation.id, `${annotation.episode} · ${result.previousStatus} → ${result.nextStatus} · ${annotation.note || "无审核意见"}`, currentUser.name);
       const refreshed = scopedState(state, currentUser); writeState(state); sendJson(res, 200, { ok: true, action, annotation: result.annotation, annotations: refreshed.annotations, annotationStandards: refreshed.annotationStandards, annotationGroups: refreshed.annotationGroups }); return true;
+    }
+    if (pathname === "/api/exceptions/review") {
+      if (!hasPermission(currentUser, ["标注审核", "问题处置", "资产管理"])) { const error = new Error("当前账号没有异常复核权限"); error.status = 403; throw error; }
+      const asset = state.assets.find(item => item.id === body.assetId);
+      if (!asset || asset.isDemo || asset.bundleRole !== "trajectory" || !Number.isInteger(episodeIndexForAsset(asset))) { const error = new Error("Episode 记录不存在"); error.status = 404; throw error; }
+      assertTypeAllowed(currentUser, asset.type);
+      const decision = String(body.decision || "").trim();
+      if (!["reviewed", "blocked"].includes(decision)) throw new Error("复核结论必须是“复核完成”或“确认异常”");
+      const note = String(body.note || "").trim();
+      if (decision === "blocked" && !note) throw new Error("确认异常时必须填写复核意见");
+      if (note.length > 1000) throw new Error("复核意见不能超过 1000 个字符");
+      const tags = [...new Set((Array.isArray(body.tags) ? body.tags : String(body.tags || "").split(/[，,]/)).map(tag => String(tag || "").trim()).filter(Boolean))].slice(0, 20);
+      const issueIds = new Set((Array.isArray(body.issueIds) ? body.issueIds : []).map(String));
+      const issues = state.issues.filter(issue => issue.assetId === asset.id && issue.status !== "已关闭" && (!issueIds.size || issueIds.has(issue.id))).map(issue => issue.id);
+      const now = new Date().toISOString(), review = {
+        id: `EXR-${crypto.randomUUID()}`, assetId: asset.id, bundleId: asset.bundleId, bundleName: asset.bundleName || asset.bundleId,
+        episodeIndex: episodeIndexForAsset(asset), type: asset.type, groupKey: annotationGroupKeyForAsset(asset), decision, note, tags, issueIds: issues,
+        reviewStatus: decision === "reviewed" ? "复核完成" : "确认异常", reviewedAt: now, reviewedBy: currentUser.name,
+      };
+      state.exceptionReviews.unshift(review); state.exceptionReviews = state.exceptionReviews.slice(0, 5000);
+      audit(state, "记录 Episode 异常复核", asset.id, `${review.episodeIndex} · ${review.reviewStatus}${note ? ` · ${note}` : ""}`, currentUser.name);
+      const refreshed = scopedState(state, currentUser); writeState(state);
+      sendJson(res, 200, { ok: true, review, exceptionReviews: refreshed.exceptionReviews }); return true;
     }
     if (pathname === "/api/exports") {
       if (body.format && !["LeRobot", "LeRobot v2.1", "lerobot"].includes(body.format)) throw new Error("此接口建立 LeRobot 基础交付记录，其他格式请使用格式转换入口");

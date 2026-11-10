@@ -6,9 +6,9 @@ const test = require('node:test');
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'serve.js'), 'utf8').replace(/\r\n/g, '\n');
 const definitions = source.split('\nensureStorage();\nconst startupState =')[0];
-const { annotationApproved, applyAnnotationUpdate, applyAnnotationStandard, bundleGate, generateAnnotationTasks, ROLE_POLICIES, ALL_PERMISSIONS } = new Function(
+const { annotationApproved, applyAnnotationUpdate, applyAnnotationStandard, submitAnnotationStandards, annotationGroupEpisodeStats, annotationGroupFlow, annotationGroupSignals, bundleGate, generateAnnotationTasks, ROLE_POLICIES, ALL_PERMISSIONS } = new Function(
   'require', '__dirname', 'process', 'Buffer',
-  `${definitions}\nreturn { annotationApproved, applyAnnotationUpdate, applyAnnotationStandard, bundleGate, generateAnnotationTasks, ROLE_POLICIES, ALL_PERMISSIONS };`,
+  `${definitions}\nreturn { annotationApproved, applyAnnotationUpdate, applyAnnotationStandard, submitAnnotationStandards, annotationGroupEpisodeStats, annotationGroupFlow, annotationGroupSignals, bundleGate, generateAnnotationTasks, ROLE_POLICIES, ALL_PERMISSIONS };`,
 )(require, root, process, Buffer);
 
 function asset(id, role, relativePath) {
@@ -139,4 +139,36 @@ test('dataset standard instruction is inherited and cannot be overridden per epi
   assert.equal(created[0].status, '标注中');
   assert.equal(created[0].progress, 40);
   assert.equal(created[0].instruction, datasetInstruction);
+});
+
+test('batch submission skips incomplete or non-editable ranges and reports stats', () => {
+  const { state, annotation } = fixture();
+  const empty = submitAnnotationStandards(state, { groupKeys: ['B-ANNOTATION', 'B-MISSING'] }, '标注员甲');
+  assert.equal(empty.submitted.length, 0);
+  assert.equal(empty.skipped.length, 2);
+  assert.match(empty.skipped.find(item => item.key === 'B-ANNOTATION').reason, /尚未填写/);
+
+  applyAnnotationStandard(state, { bundleId: 'B-ANNOTATION', instruction: datasetInstruction }, '标注员甲');
+  const submitted = submitAnnotationStandards(state, { groupKeys: ['B-ANNOTATION'] }, '标注员甲');
+  assert.equal(submitted.submitted.length, 1);
+  assert.equal(submitted.skipped.length, 0);
+  assert.equal(annotation.status, '待审核');
+
+  state.assets = state.assets.filter(item => item.bundleRole !== 'media');
+  const stats = annotationGroupEpisodeStats(state, 'B-ANNOTATION');
+  assert.equal(stats.episodeCount, 1);
+  assert.equal(stats.videoCovered, 0);
+  assert.equal(stats.missingVideoCount, 1);
+});
+
+test('dataset queue signals expose format flow and the first blocking reason', () => {
+  const { state, annotation } = fixture();
+  applyAnnotationStandard(state, { bundleId: 'B-ANNOTATION', instruction: datasetInstruction }, '标注员甲');
+  state.assets.find(item => item.id === 'trajectory').format = 'HDF5';
+  const flow = annotationGroupFlow(state, 'B-ANNOTATION');
+  assert.deepEqual(flow.sourceFormats, ['HDF5']);
+  assert.equal(flow.delivery, '未生成');
+  const signals = annotationGroupSignals(state, 'B-ANNOTATION', annotationGroupEpisodeStats(state, 'B-ANNOTATION'), state.annotationStandards['B-ANNOTATION']);
+  assert.equal(signals[0].key, 'standard');
+  assert.ok(signals.some(item => item.key === 'delivery'));
 });

@@ -96,6 +96,16 @@ test('annotation HTTP API enforces draft, submit and review transitions', async 
     const annotation = generated.body.annotations[0];
     assert.equal(annotation.status, '待标注');
 
+    const exceptionReview = await request(port, 'POST', '/api/exceptions/review', { assetId: 'trajectory', decision: 'blocked', note: '确认缺帧，需要补采', tags: ['复采'] }, reviewerCookie);
+    assert.equal(exceptionReview.status, 200);
+    assert.equal(exceptionReview.body.review.assetId, 'trajectory');
+    assert.equal(exceptionReview.body.review.reviewStatus, '确认异常');
+    assert.deepEqual(exceptionReview.body.review.tags, ['复采']);
+    const stateAfterReview = await request(port, 'GET', '/api/state', null, reviewerCookie);
+    assert.equal(stateAfterReview.status, 200);
+    assert.equal(stateAfterReview.body.exceptionReviews.length, 1);
+    assert.equal(stateAfterReview.body.exceptionReviews[0].reviewedBy, 'Reviewer');
+
     const reviewerStandard = await request(port, 'POST', '/api/annotations/standard', { bundleId: annotation.bundleId, action: 'save', instruction: datasetInstruction }, reviewerCookie);
     assert.equal(reviewerStandard.status, 403);
 
@@ -109,9 +119,13 @@ test('annotation HTTP API enforces draft, submit and review transitions', async 
     assert.equal(standardized.body.annotations[0].status, '标注中');
     assert.equal(standardized.body.annotations[0].instruction, datasetInstruction);
 
-    const submitted = await request(port, 'POST', '/api/annotations/standard', { bundleId: annotation.bundleId, action: 'submit', instruction: datasetInstruction }, editorCookie);
+    const reviewerBatch = await request(port, 'POST', '/api/annotations/batch', { groupKeys: [annotation.bundleId] }, reviewerCookie);
+    assert.equal(reviewerBatch.status, 403);
+    const submitted = await request(port, 'POST', '/api/annotations/batch', { groupKeys: [annotation.bundleId] }, editorCookie);
     assert.equal(submitted.status, 200);
-    assert.equal(submitted.body.standard.status, '待审核');
+    assert.equal(submitted.body.submitted.length, 1);
+    assert.equal(submitted.body.skipped.length, 0);
+    assert.equal(submitted.body.annotationStandards[annotation.bundleId].status, '待审核');
     assert.equal(submitted.body.annotations[0].status, '待审核');
 
     const editorApprove = await request(port, 'POST', '/api/annotations/standard', { bundleId: annotation.bundleId, action: 'approve', note: '自行通过', instruction: datasetInstruction }, editorCookie);
