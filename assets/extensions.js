@@ -3,17 +3,41 @@
   const m=value=>String(value).replaceAll('[',LT).replaceAll(']',GT);
   const extRead=(key,fallback=[])=>{try{return JSON.parse(localStorage.getItem(key)||JSON.stringify(fallback))}catch{return fallback}};
   const extWrite=(key,value)=>localStorage.setItem(key,JSON.stringify(value));
+  const CLIENT_CACHE_VERSION='2026-11-15.6';
+  try{if(localStorage.getItem('embodiedPlatformCacheVersion')!==CLIENT_CACHE_VERSION){['embodiedDataAssets','embodiedCaptureTasks','qualityRules','datasets','trainingJobs','members','platformSettings','embodiedRuns','embodiedBundles','embodiedQcBatches','embodiedAudit','embodiedEpisodeTags','embodiedIssues','embodiedAnnotations','embodiedAnnotationStandards','embodiedAnnotationGroups','embodiedExceptionReviews','embodiedV6Workflows','embodiedExports','embodiedDatasets','embodiedTrainingJobs','embodiedFeedbackSamples','embodiedNodes','embodiedMembers','embodiedRolePolicies','embodiedAuthMode','embodiedQualityRules','embodiedQualitySettings','embodiedAssetsSeeded'].forEach(key=>localStorage.removeItem(key));localStorage.setItem('embodiedPlatformCacheVersion',CLIENT_CACHE_VERSION)}}catch{}
   const rawFetch=globalThis.fetch.bind(globalThis);
-  const BACKGROUND_ROUTES={'/api/qc/run':'quality','/api/assets/lerobot-deep-check':'deep','/api/issues/recheck':'recheck','/api/exports/convert':'convert','/api/exports':'delivery','/api/backup':'backup','/api/exports/verify':'verify'};
-  const JOB_LABELS={quality:'完整质检',deep:'深度校验',recheck:'问题复检',convert:'格式转换与验证',delivery:'建立交付版本',backup:'完整备份',verify:'独立交付校验'};
-  const JOB_STATUSES={queued:'排队中',running:'执行中',succeeded:'执行完成',failed:'失败',interrupted:'重启中断'};
-  const JOB_CATEGORY={quality:'quality',deep:'quality',recheck:'quality',convert:'convert',delivery:'delivery',verify:'delivery',backup:'system'};
+  const BACKGROUND_ROUTES={'/api/qc/run':'quality','/api/assets/lerobot-deep-check':'deep','/api/episodes/preview':'preview','/api/issues/recheck':'recheck','/api/exports/convert':'convert','/api/exports':'delivery','/api/backup':'backup','/api/exports/verify':'verify'};
+  const JOB_LABELS={upload:'文件上传',quality:'完整质检',deep:'深度校验',preview:'Episode 预览生成',recheck:'问题复检',convert:'格式转换与验证',delivery:'建立交付版本',backup:'完整备份',verify:'独立交付校验'};
+  const JOB_STATUSES={queued:'排队中',running:'执行中',paused:'已暂停',succeeded:'执行完成',failed:'失败',interrupted:'重启中断',cancelled:'已删除'};
+  const JOB_CATEGORY={upload:'import',quality:'quality',deep:'quality',preview:'import',recheck:'quality',convert:'convert',delivery:'delivery',verify:'delivery',backup:'system'};
   let backgroundJobs=[];
+  let episodePreviewStates=new Map(),episodePreviewPollTimer=null,episodePreviewOpenAfter=new Set();
+  const activeUploads=new Map();
   let taskCenterFilter='all';
   let taskCenterQuery='';
   async function refreshBackgroundJobs(){
     if(!authUser)return;
     try{const response=await rawFetch('/api/jobs',{cache:'no-store'});if(!response.ok)return;const data=await response.json();backgroundJobs=data.jobs||[];let button=document.getElementById('backgroundJobsButton');if(!button){button=document.createElement('button');button.id='backgroundJobsButton';button.className='btn';document.getElementById('refreshBtn')?.parentElement?.prepend(button)}button.onclick=()=>navigate('jobs',document.querySelector('.nav button[data-page="jobs"]'));button.textContent=`任务中心 · ${backgroundJobs.filter(job=>['queued','running'].includes(job.status)).length} 进行中`;if(document.getElementById('backgroundJobRows'))renderBackgroundJobRows();if(document.getElementById('taskCenterJobRows'))renderTaskCenterRows()}catch{}
+  }
+  function syncLocalUploadTask(upload,status=null){
+    if(!upload?.id)return;const resolved=status||(upload.status==='paused'?'paused':upload.status==='complete'?'succeeded':'running');
+    const task={id:`UP-${upload.id}`,uploadSessionId:upload.id,kind:'upload',payload:{assetId:upload.assetId,name:upload.name,size:upload.size},userId:authUser?.id,userName:authUser?.name||'上传用户',status:resolved,completed:Number(upload.offset||0),total:Number(upload.size||0),progress:upload.size?Number((Number(upload.offset||0)/Number(upload.size)*100).toFixed(1)):0,message:resolved==='paused'?'上传已暂停':resolved==='succeeded'?'上传完成':'正在上传',createdAt:upload.createdAt||new Date().toISOString(),startedAt:upload.createdAt||new Date().toISOString(),finishedAt:resolved==='succeeded'?new Date().toISOString():null};
+    const index=backgroundJobs.findIndex(job=>job.id===task.id);if(index>=0)backgroundJobs[index]={...backgroundJobs[index],...task};else backgroundJobs.unshift(task);
+    if(document.getElementById('taskCenterJobRows'))renderTaskCenterRows();
+  }
+  async function controlTask(job,action,button){
+    button.disabled=true;const uploadControl=job.kind==='upload'?activeUploads.get(job.uploadSessionId):null;
+    try{
+      if(job.kind==='upload'&&action==='pause'&&uploadControl){uploadControl.paused=true;syncLocalUploadTask({...job,status:'paused'},'paused')}
+      if(job.kind==='upload'&&action==='delete'&&uploadControl){uploadControl.paused=true}
+      if(job.kind==='upload'&&action==='resume'&&!uploadControl)throw new Error('页面刷新后本地文件句柄已丢失，请重新选择原文件继续');
+      const send=()=>rawFetch(`/api/jobs/${encodeURIComponent(job.id)}${action==='delete'?'':'/'+action}`,{method:action==='delete'?'DELETE':'POST'});let response=await send();
+      if(job.kind==='upload'&&['pause','delete'].includes(action))for(let attempt=0;attempt<40&&response.status===409;attempt++){await new Promise(resolve=>setTimeout(resolve,250));response=await send()}
+      const data=await response.json();if(!response.ok)throw new Error(data.error||'任务操作失败');
+      if(job.kind==='upload'&&uploadControl&&action==='resume'){uploadControl.paused=false;uploadControl.wake?.();uploadControl.wake=null}
+      if(job.kind==='upload'&&uploadControl&&action==='delete'){uploadControl.cancelled=true;uploadControl.wake?.();uploadControl.wake=null}
+      await refreshBackgroundJobs();showToast(action==='pause'?'任务已暂停':action==='resume'?'任务已继续':'任务已删除');renderTaskCenterRows();
+    }catch(error){if(job.kind==='upload'&&action==='pause'&&uploadControl){uploadControl.paused=false;uploadControl.wake?.();uploadControl.wake=null}button.disabled=false;showToast(error.message);throw error}
   }
   function renderBackgroundJobRows(){
     const box=document.getElementById('backgroundJobRows');if(!box)return;
@@ -28,9 +52,28 @@
     dialog.classList.add('show');document.getElementById('closeBackgroundJobs').onclick=()=>dialog.classList.remove('show');document.getElementById('refreshJobResults').onclick=async()=>{await syncServerState();showToast('业务结果已从服务端刷新')};const taskCenterLink=document.getElementById('openTaskCenterFromJobs');if(taskCenterLink)taskCenterLink.onclick=()=>{dialog.classList.remove('show');navigate('jobs',document.querySelector('.nav button[data-page="jobs"]'))};await refreshBackgroundJobs();renderBackgroundJobRows();
   }
   function taskJobCategory(job){return JOB_CATEGORY[job.kind]||'system'}
-  function taskJobTitle(job){const target=job.payload?.bundleId||job.payload?.batchId||job.payload?.dataset||job.payload?.name||(job.payload?.assetIds?.length?`${job.payload.assetIds.length} 个资产`:'平台操作');return `${JOB_LABELS[job.kind]||job.kind} · ${target}`}
+  function taskJobTitle(job){const target=job.payload?.bundleId||job.payload?.batchId||job.payload?.dataset||job.payload?.name||job.payload?.assetId||(job.payload?.assetIds?.length?`${job.payload.assetIds.length} 个资产`:'平台操作');return `${JOB_LABELS[job.kind]||job.kind} · ${target}`}
   function taskTime(value){return value?new Date(value).toLocaleString('zh-CN',{hour12:false}):'--'}
   function taskDuration(job){const start=Date.parse(job.startedAt||job.createdAt),end=Date.parse(job.finishedAt||'');if(!Number.isFinite(start)||!Number.isFinite(end))return job.status==='running'?'进行中':'--';const seconds=Math.max(0,Math.round((end-start)/1000));return seconds<60?`${seconds}s`:`${Math.floor(seconds/60)}m ${seconds%60}s`}
+  const pipelinePercent=(done,total)=>total>0?Math.max(0,Math.min(100,Math.round(done/total*100))):0;
+  function pipelineStage(done,total,applicable=true){return {done:Number(done||0),total:Number(total||0),applicable,percent:applicable?pipelinePercent(done,total):0}}
+  function pipelineFromFiles(files,bundleIds,groups,exportsList){
+    const episodes=files.filter(isLogicalEpisodeAsset),approvedEpisodes=episodes.filter(asset=>annotationGroupApproved(asset,groups)).length,relatedExports=exportsList.filter(job=>bundleIds.has(job.batchId)||(job.batchIds||[]).some(id=>bundleIds.has(id))),formats=new Set(relatedExports.flatMap(job=>Object.entries(job.conversions||{}).filter(([,output])=>output?.ok===true&&output?.independentVerification?.ok===true).map(([format])=>format)));
+    const upload=pipelineStage(files.filter(asset=>asset.serverFile).length,files.length),clean=pipelineStage(files.filter(asset=>asset.serverFile&&asset.serverFile.contentCheck?.valid!==false&&asset.serverFile.deepCheck?.status!=='invalid').length,files.length),quality=pipelineStage(files.filter(asset=>asset.lastQcAt&&asset.inspection?.production?.sha256===asset.serverFile?.sha256&&!asset.inspection.production.error).length,files.length),annotation=pipelineStage(approvedEpisodes,episodes.length,episodes.length>0),convert=pipelineStage(formats.size,3,files.length>0);
+    const stages=[upload,clean,quality,convert,...(annotation.applicable?[annotation]:[])],overall=Math.round(stages.reduce((sum,stage)=>sum+stage.percent,0)/Math.max(1,stages.length));
+    return {upload,clean,quality,annotation,convert,overall};
+  }
+  function pipelineProgressRows(){
+    const assets=getAssets(),storedBundles=extRead('embodiedBundles',[]),storedMap=new Map(storedBundles.map(item=>[item.id,item])),bundleMap=new Map(),exportsList=extRead('embodiedExports',[]),groups=extRead('embodiedAnnotationGroups',[]).length?extRead('embodiedAnnotationGroups',[]):annotationGroupsLocal(),taskList=readStore(storageKey.tasks,[]),claimed=new Set();
+    assets.filter(asset=>asset.bundleId).forEach(asset=>{if(!bundleMap.has(asset.bundleId))bundleMap.set(asset.bundleId,{id:asset.bundleId,name:asset.bundleName||asset.bundleId,type:asset.type,preset:asset.bundlePreset||'',files:[]});bundleMap.get(asset.bundleId).files.push(asset)});
+    [...storedMap.values()].forEach(bundle=>{if(!bundleMap.has(bundle.id))bundleMap.set(bundle.id,{id:bundle.id,name:bundle.name||bundle.id,type:bundle.type||'',preset:bundle.preset||'',files:[]})});
+    const taskRows=taskList.map(task=>{const files=assets.filter(asset=>asset.taskId===task.id),bundleIds=new Set(files.map(asset=>asset.bundleId).filter(Boolean));bundleIds.forEach(id=>claimed.add(id));return {id:task.id,kind:'task',name:task.name||task.id,detail:`${task.type||''} · 目标 ${Number(task.targetCount||0)} · 已上传 ${files.filter(asset=>asset.serverFile).length}/${files.length}`,status:task.status||'待启动',page:'tasks',...pipelineFromFiles(files,bundleIds,groups,exportsList)}});
+    const bundleRows=[...bundleMap.values()].filter(bundle=>!claimed.has(bundle.id)).map(bundle=>{const stored=storedMap.get(bundle.id)||{},bundleIds=new Set([bundle.id]);return {id:bundle.id,kind:'bundle',name:bundle.name,detail:`${bundle.type||''} · ${bundle.preset||'兼容预设'} · ${bundle.files.length} 个文件`,status:stored.status||(bundle.files.every(asset=>asset.serverFile)?'处理中':'上传中'),page:'intake',...pipelineFromFiles(bundle.files,bundleIds,groups,exportsList)}});
+    return [...taskRows,...bundleRows];
+  }
+  function filteredPipelineRows(){const query=taskCenterQuery.trim().toLowerCase();if(taskCenterFilter==='failed')return [];return pipelineProgressRows().filter(row=>(taskCenterFilter==='all'||['import','quality','annotation','convert'].includes(taskCenterFilter))&&(!query||`${row.name} ${row.detail} ${row.status}`.toLowerCase().includes(query)))}
+  function pipelineProgressCell(stage,label){if(!stage.applicable)return `<span class="pipeline-na">不适用</span>`;return `<div class="pipeline-progress" title="${escapeHtml(label)} ${stage.done}/${stage.total}"><div><i style="width:${stage.percent}%"></i></div><small>${stage.done}/${stage.total}</small></div>`}
+  function taskCenterPipelineRowsHtml(){const rows=filteredPipelineRows();return rows.length?rows.map(row=>`<tr><td><b>${escapeHtml(row.name)}</b><br><small>${escapeHtml(row.detail)}</small></td><td>${pipelineProgressCell(row.upload,'上传')}</td><td>${pipelineProgressCell(row.clean,'清洗')}</td><td>${pipelineProgressCell(row.quality,'质检')}</td><td>${pipelineProgressCell(row.annotation,'标注')}</td><td>${pipelineProgressCell(row.convert,'转换')}</td><td><div class="pipeline-overall"><b>${row.overall}%</b>${statusBadge(row.status)}</div></td><td><button class="btn" data-task-page="${escapeHtml(row.page)}">查看</button></td></tr>`).join(''):'<tr><td colspan="8"><div class="empty-inline">当前筛选条件下没有全流程任务</div></td></tr>'}
   function taskCenterBusinessRows(){
     const importRows=extRead('embodiedBundles',[]).slice(0,8).map(bundle=>({category:'import',label:'数据接入',name:bundle.name||bundle.id,status:bundle.status||'待接入',detail:`${Number(bundle.assetCount||0)} 个文件 · ${Number(bundle.episodeCount||0)} 个 Episode`,updatedAt:bundle.acceptedAt||bundle.submittedAt||bundle.createdAt||'',page:'intake'}));
     const annotationRows=annotationGroupsLocal().filter(group=>['待标注','标注中','待审核','已驳回'].includes(group.status)).slice(0,12).map(group=>({category:'annotation',label:'标注与审核',name:group.name,status:group.status,detail:`${group.episodeCount} 个 Episode · ${group.primarySignal?.label||(group.instruction?'标准已填写':'待填写标准')}`,updatedAt:group.updatedAt||group.reviewedAt||'',page:'annotation',groupKey:group.key}));
@@ -47,12 +90,12 @@
     return html||'<tr><td colspan="5"><div class="empty-inline">当前筛选条件下没有业务待办</div></td></tr>';
   }
   function taskCenterKpisHtml(){
-    const running=backgroundJobs.filter(job=>job.status==='running').length,queued=backgroundJobs.filter(job=>job.status==='queued').length,failed=backgroundJobs.filter(job=>['failed','interrupted'].includes(job.status)).length,business=taskCenterBusinessRows().length;
-    return `<div class="ext-kpis" id="taskCenterKpis"><div class="ext-kpi"><span>执行中 / 排队</span><b>${running} / ${queued}</b><small>后台任务队列</small></div><div class="ext-kpi"><span>失败 / 中断</span><b class="${failed?'danger':''}">${failed}</b><small>可在操作列重试</small></div><div class="ext-kpi"><span>业务待办</span><b>${business}</b><small>导入、标注、交付</small></div><div class="ext-kpi"><span>已完成</span><b>${backgroundJobs.filter(job=>job.status==='succeeded').length}</b><small>保留结果与日志</small></div></div>`;
+    const running=backgroundJobs.filter(job=>job.status==='running').length,queued=backgroundJobs.filter(job=>job.status==='queued').length,failed=backgroundJobs.filter(job=>['failed','interrupted'].includes(job.status)).length,pipeline=pipelineProgressRows().length,business=taskCenterBusinessRows().length;
+    return `<div class="ext-kpis" id="taskCenterKpis"><div class="ext-kpi"><span>全流程对象</span><b>${pipeline}</b><small>生产任务与数据包</small></div><div class="ext-kpi"><span>执行中 / 排队</span><b>${running} / ${queued}</b><small>后台任务队列</small></div><div class="ext-kpi"><span>失败 / 中断</span><b class="${failed?'danger':''}">${failed}</b><small>可在操作列重试</small></div><div class="ext-kpi"><span>业务待办 / 完成</span><b>${business} / ${backgroundJobs.filter(job=>job.status==='succeeded').length}</b><small>待办与成功后台任务</small></div></div>`;
   }
   function jobsTemplate(){
     const options=[['all','全部环节'],['import','数据接入'],['quality','质检'],['annotation','标注与审核'],['convert','格式转换'],['delivery','交付'],['failed','失败 / 中断']];
-    return `${taskCenterKpisHtml()}<section class="panel task-center-panel"><div class="panel-head"><div><div class="panel-title">后台执行任务</div><div class="panel-sub">导入、质检、标注、转换和交付记录集中查看；失败任务可重试</div></div><div class="row-actions"><button class="btn" id="taskCenterRefresh"><i data-lucide="refresh-cw"></i>刷新任务</button></div></div><div class="table-toolbar"><div class="search"><i data-lucide="search"></i><input id="taskCenterSearch" value="${escapeHtml(taskCenterQuery)}" placeholder="搜索任务、批次或负责人" /></div><select class="filter-select" id="taskCenterFilter">${options.map(([value,label])=>`<option value="${value}"${taskCenterFilter===value?' selected':''}>${label}</option>`).join('')}</select></div><div class="table-scroll"><table class="module-table"><thead><tr><th>环节</th><th>任务</th><th>状态</th><th>进度</th><th>创建时间</th><th>耗时</th><th>操作</th></tr></thead><tbody id="taskCenterJobRows">${taskCenterJobRowsHtml()}</tbody></table></div></section><section class="panel task-center-panel" style="margin-top:16px"><div class="panel-head"><div><div class="panel-title">业务待办</div><div class="panel-sub">只展示需要进入下一环节的对象，不复制后台任务执行记录</div></div></div><div class="table-scroll"><table class="module-table"><thead><tr><th>环节</th><th>对象</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="taskCenterBusinessRows">${taskCenterBusinessRowsHtml()}</tbody></table></div></section>`;
+    return `${taskCenterKpisHtml()}<section class="panel task-center-panel"><div class="panel-head"><div><div class="panel-title">任务全流程进度</div><div class="panel-sub">每个采集任务或数据包的上传、清洗、质检、标注和转换完成度</div></div><div class="row-actions"><button class="btn" id="taskCenterRefresh"><i data-lucide="refresh-cw"></i>刷新任务</button></div></div><div class="table-toolbar"><div class="search"><i data-lucide="search"></i><input id="taskCenterSearch" value="${escapeHtml(taskCenterQuery)}" placeholder="搜索任务、批次或负责人" /></div><select class="filter-select" id="taskCenterFilter">${options.map(([value,label])=>`<option value="${value}"${taskCenterFilter===value?' selected':''}>${label}</option>`).join('')}</select></div><div class="table-scroll"><table class="module-table pipeline-table"><thead><tr><th>任务 / 数据包</th><th>上传</th><th>清洗</th><th>质检</th><th>标注</th><th>转换</th><th>总进度</th><th>操作</th></tr></thead><tbody id="taskCenterPipelineRows">${taskCenterPipelineRowsHtml()}</tbody></table></div></section><section class="panel task-center-panel" style="margin-top:16px"><div class="panel-head"><div><div class="panel-title">后台执行任务</div><div class="panel-sub">导入、质检、标注、转换和交付记录集中查看；失败任务可重试</div></div></div><div class="table-scroll"><table class="module-table"><thead><tr><th>环节</th><th>任务</th><th>状态</th><th>进度</th><th>创建时间</th><th>耗时</th><th>操作</th></tr></thead><tbody id="taskCenterJobRows">${taskCenterJobRowsHtml()}</tbody></table></div></section><section class="panel task-center-panel" style="margin-top:16px"><div class="panel-head"><div><div class="panel-title">业务待办</div><div class="panel-sub">只展示需要进入下一环节的对象，不复制后台任务执行记录</div></div></div><div class="table-scroll"><table class="module-table"><thead><tr><th>环节</th><th>对象</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="taskCenterBusinessRows">${taskCenterBusinessRowsHtml()}</tbody></table></div></section>`;
   }
   function openTaskCenterDialog(job,mode='detail'){
     if(!job)return;let dialog=document.getElementById('taskCenterDialog');if(!dialog){dialog=document.createElement('div');dialog.id='taskCenterDialog';dialog.className='search-dialog';document.body.appendChild(dialog)}
@@ -65,10 +108,11 @@
   }
   function bindTaskCenterRows(){
     document.querySelectorAll('[data-job-detail],[data-job-log]').forEach(button=>button.onclick=()=>{const job=backgroundJobs.find(item=>item.id===(button.dataset.jobDetail||button.dataset.jobLog));openTaskCenterDialog(job,button.dataset.jobLog?'log':'detail')});
+    document.querySelectorAll('[data-job-detail]').forEach(button=>{const job=backgroundJobs.find(item=>item.id===button.dataset.jobDetail),actions=button.parentElement;if(!job||!actions)return;const add=(action,label,disabled=false,title='')=>{const control=document.createElement('button');control.className=`btn${action==='delete'?' danger':''}`;control.textContent=label;control.disabled=disabled;control.title=title||label;control.onclick=()=>controlTask(job,action,control).catch(()=>{});actions.appendChild(control)};if(['queued','running','paused'].includes(job.status)){const canResume=job.status!=='paused'||job.kind!=='upload'||activeUploads.has(job.uploadSessionId);add(job.status==='paused'?'resume':'pause',job.status==='paused'?'继续':'暂停',job.status==='running'&&job.kind!=='upload'||!canResume,job.status==='running'&&job.kind!=='upload'?'运行中任务不能安全暂停，请等待当前处理结束':!canResume?'页面刷新后需重新选择原文件继续':'')}add('delete','删除',job.status==='running'&&job.kind!=='upload','运行中的后台任务不能直接删除')});
     document.querySelectorAll('[data-job-retry]').forEach(button=>button.onclick=async()=>{button.disabled=true;try{const response=await rawFetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({retryOf:button.dataset.jobRetry})}),data=await response.json();if(!response.ok)throw new Error(data.error||'任务重试失败');await refreshBackgroundJobs();renderTaskCenterRows();showToast('任务已重新进入队列')}catch(error){button.disabled=false;showToast(error.message)}});
     document.querySelectorAll('[data-task-page]').forEach(button=>button.onclick=()=>{if(button.dataset.taskGroup)activeAnnotationGroupKey=button.dataset.taskGroup;navigate(button.dataset.taskPage,document.querySelector(`.nav button[data-page="${button.dataset.taskPage}"]`))});
   }
-  function renderTaskCenterRows(){const jobs=document.getElementById('taskCenterJobRows'),business=document.getElementById('taskCenterBusinessRows'),kpis=document.getElementById('taskCenterKpis');if(jobs)jobs.innerHTML=taskCenterJobRowsHtml();if(business)business.innerHTML=taskCenterBusinessRowsHtml();if(kpis)kpis.outerHTML=taskCenterKpisHtml();bindTaskCenterRows()}
+  function renderTaskCenterRows(){const pipeline=document.getElementById('taskCenterPipelineRows'),jobs=document.getElementById('taskCenterJobRows'),business=document.getElementById('taskCenterBusinessRows'),kpis=document.getElementById('taskCenterKpis');if(pipeline)pipeline.innerHTML=taskCenterPipelineRowsHtml();if(jobs)jobs.innerHTML=taskCenterJobRowsHtml();if(business)business.innerHTML=taskCenterBusinessRowsHtml();if(kpis)kpis.outerHTML=taskCenterKpisHtml();bindTaskCenterRows()}
   async function bindJobs(){
     const filter=document.getElementById('taskCenterFilter');if(filter)filter.onchange=()=>{taskCenterFilter=filter.value;renderTaskCenterRows()};
     const search=document.getElementById('taskCenterSearch');if(search){let timer=null;search.oninput=()=>{taskCenterQuery=search.value;if(timer)clearTimeout(timer);timer=setTimeout(renderTaskCenterRows,200)}}
@@ -104,23 +148,45 @@
   }
   async function fileDigest(blob){const bytes=await blob.arrayBuffer();if(!crypto.subtle)return localSha256(bytes);return [...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(value=>value.toString(16).padStart(2,'0')).join('')}
   function uploadIdentity(){return [...crypto.getRandomValues(new Uint8Array(16))].map(value=>value.toString(16).padStart(2,'0')).join('')}
+  function uploadKey(file){return localSha256(new TextEncoder().encode(`${file.webkitRelativePath||file.name}|${file.size}|${file.lastModified}`))}
+  function importFileFingerprint(files){const metadata=files.map(file=>`${file.webkitRelativePath||file.name}\0${file.size}\0${file.lastModified||0}`).join('\n');return localSha256(new TextEncoder().encode(metadata))}
+  function importAssetIds(bundleId,count){return Array.from({length:count},(_,index)=>`AST-${localSha256(new TextEncoder().encode(`${bundleId}|${index}`)).slice(0,40)}`)}
 
-  async function resumableUpload(file,metadata){
-    const saved=await rawFetch('/api/assets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...metadata,size:file.size})}),created=await saved.json();if(!saved.ok)throw new Error(created.error);
-    const key=await fileDigest(new Blob([`${file.webkitRelativePath||file.name}|${file.size}|${file.lastModified}`]));
-    const response=await rawFetch('/api/uploads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({assetId:metadata.id,name:file.name,size:file.size,key})}),data=await response.json();if(!response.ok)throw new Error(data.error);
-    let upload=data.upload;
-    // Re-read the selected file locally to verify every previously committed chunk.
-    // A changed file with the same name/size/date must never be silently spliced.
-    for(let index=0;index<upload.chunks.length;index++)if(await fileDigest(file.slice(index*upload.chunkSize,Math.min((index+1)*upload.chunkSize,file.size)))!==upload.chunks[index])throw new Error('已选文件与续传内容不同，请使用原文件或建立新批次');
+  async function verifyResumeSamples(file,upload){
+    const count=upload.chunks.length;if(!count)return;
+    const indexes=count<=8?Array.from({length:count},(_,index)=>index):[...new Set([0,count-1,Math.floor(count/3),Math.floor(count*2/3)])];
+    for(const index of indexes){
+      const digest=await fileDigest(file.slice(index*upload.chunkSize,Math.min((index+1)*upload.chunkSize,file.size)));
+      if(digest!==upload.chunks[index])throw new Error('已选文件与续传内容不同，请使用原文件或建立新批次');
+    }
+  }
+  async function resumableUpload(file,metadata,onProgress=()=>{},options={}){
+    let upload=options.session||null;
+    if(!upload){
+      let created;
+      if(metadata.__registered){created={asset:metadata}}
+      else{const payload={...metadata,size:file.size};delete payload.__registered;const saved=await rawFetch('/api/assets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});created=await saved.json();if(!saved.ok)throw new Error(created.error)}
+      const response=await rawFetch('/api/uploads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({assetId:metadata.id,name:file.name,size:file.size,key:uploadKey(file)})}),data=await response.json();if(!response.ok)throw new Error(data.error);
+      upload=data.upload;
+    }
+    const control={paused:false,cancelled:false,wake:null};activeUploads.set(upload.id,control);syncLocalUploadTask(upload);
+    if(upload.status==='paused'){const resumed=await rawFetch(`/api/jobs/UP-${upload.id}/resume`,{method:'POST'}),resumeData=await resumed.json();if(!resumed.ok)throw new Error(resumeData.error||'恢复上传任务失败');upload.status='uploading'}
+    const waitIfPaused=async()=>{if(control.cancelled)throw new Error('上传任务已删除');while(control.paused&&!control.cancelled)await new Promise(resolve=>{control.wake=resolve});if(control.cancelled)throw new Error('上传任务已删除')};
+    try{
+    await verifyResumeSamples(file,upload);onProgress({file,offset:upload.offset,size:file.size});syncLocalUploadTask(upload);
     while(upload.offset<file.size){
+      await waitIfPaused();
       const offset=upload.offset,chunk=file.slice(offset,Math.min(offset+upload.chunkSize,file.size));let uploaded;
       for(let attempt=0;attempt<3;attempt++){
-        try{const part=await rawFetch(`/api/uploads/${upload.id}`,{method:'PATCH',headers:{'Upload-Offset':String(offset),'Content-Type':'application/octet-stream'},body:chunk});uploaded=await part.json();if(!part.ok)throw new Error(uploaded.error);break}catch(error){if(attempt===2)throw error;const check=await rawFetch(`/api/uploads/${upload.id}`);if(check.ok){const current=(await check.json()).upload;if(current.offset===offset+chunk.size){uploaded={upload:current};break}if(current.offset!==offset)throw new Error('上传偏移冲突，请重新选择文件夹续传')}}
+        await waitIfPaused();
+        try{const part=await rawFetch(`/api/uploads/${upload.id}`,{method:'PATCH',headers:{'Upload-Offset':String(offset),'Content-Type':'application/octet-stream'},body:chunk});uploaded=await part.json();if(!part.ok)throw new Error(uploaded.error);break}catch(error){if(attempt===2)throw error;const check=await rawFetch(`/api/uploads/${upload.id}`);if(check.ok){const current=(await check.json()).upload;if(current.offset===offset+chunk.size){uploaded={upload:current};break}if(current.offset<offset){upload=current;uploaded={upload:current};break}if(current.offset!==offset)throw new Error('上传偏移冲突，请重新选择文件夹续传')}}
       }
-      upload=uploaded.upload;const button=document.getElementById('importWizardSubmit');if(button)button.textContent=`${file.name} · 已上传 ${Math.round(upload.offset/file.size*100)}%（${upload.offset}/${file.size} 字节）`;
+      upload=uploaded.upload;onProgress({file,offset:upload.offset,size:file.size});syncLocalUploadTask(upload);
     }
-    const completed=await rawFetch(`/api/uploads/${upload.id}/complete`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}),result=await completed.json();if(!completed.ok)throw new Error(result.error);return result.asset;
+    await waitIfPaused();
+    if(options.deferComplete){syncLocalUploadTask(upload);return{deferred:true,session:upload};}
+    const completed=await rawFetch(`/api/uploads/${upload.id}/complete`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}),result=await completed.json();if(!completed.ok)throw new Error(result.error);syncLocalUploadTask({...upload,status:'complete'},'succeeded');return result.asset;
+    }finally{activeUploads.delete(upload.id)}
   }
   let authUser=null,authRefreshPending=false,authRetryTimer=null;
   const PAGE_ACCESS={overview:[],intake:['资产查看','资产上传','资产管理'],workflow:[],assets:['资产查看','资产上传','资产管理'],quality:['规则管理','运行质检','资产查看'],qc:['运行质检','资产管理'],issues:['问题查看','问题处置'],datasets:['数据集查看','数据集发布','训练调度'],training:['训练调度','数据集查看','失败样本回流'],episodes:['资产查看','标注查看','标注编辑','标注审核'],annotation:['标注查看','标注编辑','标注审核'],jobs:[],exports:['数据集发布'],tasks:['采集任务'],nodes:['节点管理'],users:['成员管理'],audit:['成员管理','平台设置']};
@@ -170,10 +236,20 @@
     {id:'trajectory',label:'轨迹 / 状态',hint:'Parquet、JSONL、CSV、MCAP、关节与传感器流'},
     {id:'media',label:'视频 / 图像',hint:'MP4、MOV、WebM、图片序列或相机流'},
   ];
+  const FORMAT_IMPORT_PRESETS=[
+    {id:'lerobot-v21',label:'LeRobot v2.1 三组数据包',required:true,description:'目录包含 meta、Parquet 轨迹和视频，按 LeRobot v2.1 结构校验。'},
+    {id:'hdf5',label:'HDF5 轨迹 / 传感器数据包',required:false,description:'识别 .h5 / .hdf5 文件，允许单文件或多 Episode 文件组合。'},
+    {id:'mcap',label:'MCAP / ROS Bag 轨迹包',required:false,description:'识别 .mcap / .bag 轨迹包，并保留同批次配套文件。'},
+    {id:'parquet',label:'Parquet 轨迹数据包',required:false,description:'识别 Parquet 轨迹、状态或表格数据。'},
+    {id:'structured',label:'JSON / JSONL / CSV 结构化数据包',required:false,description:'识别配置、任务、标注或结构化传感器数据。'},
+    {id:'media',label:'视频 / 图像数据包',required:false,description:'识别视频和图像序列，适合媒体侧数据或补充材料。'},
+    {id:'single',label:'单文件 / 多文件兼容导入',required:false,description:'文件组合未命中专用规则时使用；仍会保留自动识别结果。'},
+  ];
+  const formatPreset=id=>FORMAT_IMPORT_PRESETS.find(item=>item.id===id);
   const IMPORT_PRESETS={
-    遥操:[{id:'lerobot-v21',label:'LeRobot v2.1 三组数据包',required:true},{id:'standard-3',label:'遥操标准三组数据包',required:true},{id:'single',label:'单文件 / 多文件兼容导入',required:false}],
-    UMI:[{id:'standard-3',label:'UMI 标准三组数据包',required:true},{id:'single',label:'单文件 / 多文件兼容导入',required:false}],
-    EGO:[{id:'standard-3',label:'EGO 标准三组数据包',required:true},{id:'single',label:'单文件 / 多文件兼容导入',required:false}],
+    遥操:[formatPreset('lerobot-v21'),{id:'standard-3',label:'遥操标准三组数据包',required:true,description:'必须包含 meta、轨迹/状态和视频三组文件。'},...FORMAT_IMPORT_PRESETS.slice(1)],
+    UMI:[formatPreset('lerobot-v21'),{id:'standard-3',label:'UMI 标准三组数据包',required:true,description:'必须包含 meta、轨迹/状态和视频三组文件。'},...FORMAT_IMPORT_PRESETS.slice(1)],
+    EGO:[formatPreset('lerobot-v21'),{id:'standard-3',label:'EGO 标准三组数据包',required:true,description:'必须包含 meta、轨迹/状态和视频三组文件。'},...FORMAT_IMPORT_PRESETS.slice(1)],
   };
   const QC_TEMPLATES=['快速质检','标准质检','全量质检','仅同步检测'];
   const ROLE_NAMES=['数据治理负责人','质量工程师','标注审核员','算法工程师','采集运维'];
@@ -234,11 +310,16 @@
     return {assets,openIssues,qcAssets,scored,passed,withOriginal,batches,average,passRate,evidenceRate,highIssues:openIssues.filter(item=>item.level==='高').length,byType};
   }
   function annotationGroupApproved(asset,groups=extRead('embodiedAnnotationGroups',[])){const key=String(asset?.taskId?`TASK:${asset.taskId}`:asset?.bundleId||'');return Boolean(key&&groups.some(item=>item.key===key&&item.status==='已通过'))}
+  function isSequenceAsset(asset){return asset?.bundleRole==='trajectory'&&(asset.format==='HDF5_SEQUENCE'||asset.serverFile?.mode==='external-hdf5-sequence')}
+  function isUmiSessionAsset(asset){return asset?.bundleRole==='trajectory'&&(asset.format==='UMI_SESSION'||asset.serverFile?.mode==='external-umi-session')}
+  function isLogicalEpisodeAsset(asset){return asset?.bundleRole==='trajectory'&&(/episode_\d+\.parquet$/i.test(asset.relativePath||asset.name||'')||isSequenceAsset(asset)||isUmiSessionAsset(asset))}
+  function episodeIndexForAsset(asset){if(Number.isInteger(asset?.episodeIndex))return Number(asset.episodeIndex);const match=/episode_(\d+)\.(?:parquet|mp4)$/i.exec(asset?.relativePath||asset?.name||'');return match?Number(match[1]):null}
+  function packageRequiredRoles(files,stored={}){const preset=String(stored.preset||files[0]?.bundlePreset||''),roles=new Set(files.map(file=>file.bundleRole).filter(Boolean));if(['lerobot-v21','standard-3'].includes(preset))return ['meta','trajectory','media'];if(preset==='media')return ['media'];if(['hdf5','hdf5-sequence','umi-session','mcap','parquet','structured'].includes(preset))return ['trajectory'];if(preset==='single')return roles.has('trajectory')?['trajectory']:roles.has('media')?['media']:roles.has('meta')?['meta']:[];if(roles.has('meta')||roles.has('media'))return [...roles];if(roles.has('trajectory'))return ['trajectory'];return [...roles]}
   function packageHealthRows(snapshot){
     const bundles=new Map();
     snapshot.assets.filter(asset=>asset.bundleId).forEach(asset=>{if(!bundles.has(asset.bundleId))bundles.set(asset.bundleId,{id:asset.bundleId,name:asset.bundleName||asset.bundleId,type:asset.type,files:[],roles:new Set()});const bundle=bundles.get(asset.bundleId);bundle.files.push(asset);if(asset.bundleRole)bundle.roles.add(asset.bundleRole)});
     const storedBundles=new Map(extRead('embodiedBundles',[]).map(item=>[item.id,item]));
-    return [...bundles.values()].map(bundle=>{const stored=storedBundles.get(bundle.id)||{},episodes=bundle.files.filter(asset=>asset.bundleRole==='trajectory'&&/episode_\d+\.parquet$/i.test(asset.relativePath||asset.name)),episodeIds=new Set(episodes.map(asset=>asset.id)),issues=snapshot.openIssues.filter(issue=>bundle.files.some(asset=>asset.id===issue.assetId)),annotations=extRead('embodiedAnnotations',[]).filter(item=>episodeIds.has(item.assetId)),annotationPending=episodes.filter(asset=>!annotationGroupApproved(asset)),episodeMediaPending=episodes.filter(asset=>!bundle.files.some(media=>media.bundleRole==='media'&&new RegExp(`episode_0*${Number(/episode_(\d+)\.parquet$/i.exec(asset.relativePath||asset.name)[1])}(?:\\D|$)`,'i').test(media.relativePath||media.name))).length,original=bundle.files.filter(asset=>asset.serverFile).length,qc=bundle.files.filter(asset=>asset.lastQcAt&&asset.inspection?.production?.sha256===asset.serverFile?.sha256&&!asset.inspection.production.error).length,complete=episodes.length>0&&['meta','trajectory','media'].every(role=>bundle.roles.has(role)),ready=complete&&episodeMediaPending===0&&original===bundle.files.length&&qc===bundle.files.length&&bundle.files.every(asset=>asset.status==='已通过')&&!issues.length&&!annotationPending.length,derivedStatus=ready?'可提交验收':issues.length?'需处理':episodeMediaPending||!complete?'待补齐':annotationPending.length?'待标注':'待质检',status=ready&&stored.gateVersion==='episode-v2'&&['待验收','已验收','已归档'].includes(stored.status)?stored.status:derivedStatus;return {...bundle,...stored,issueCount:issues.length,annotationCount:annotations.length,annotationPending:annotationPending.length,episodeMediaPending,episodeCount:episodes.length,original,qc,complete,ready,status}});
+    return [...bundles.values()].map(bundle=>{const stored=storedBundles.get(bundle.id)||{},episodes=bundle.files.filter(isLogicalEpisodeAsset),episodeIds=new Set(episodes.map(asset=>asset.id)),issues=snapshot.openIssues.filter(issue=>bundle.files.some(asset=>asset.id===issue.assetId)),annotations=extRead('embodiedAnnotations',[]).filter(item=>episodeIds.has(item.assetId)),annotationPending=episodes.filter(asset=>!annotationGroupApproved(asset)),episodeMediaPending=episodes.filter(asset=>!isSequenceAsset(asset)&&!isUmiSessionAsset(asset)&&!bundle.files.some(media=>media.bundleRole==='media'&&new RegExp(`episode_0*${episodeIndexForAsset(asset)}(?:\\D|$)`,'i').test(media.relativePath||media.name))).length,original=bundle.files.filter(asset=>asset.serverFile).length,qc=bundle.files.filter(asset=>asset.lastQcAt&&asset.inspection?.production?.sha256===asset.serverFile?.sha256&&!asset.inspection.production.error).length,requiredRoles=packageRequiredRoles(bundle.files,stored),missingRoles=requiredRoles.filter(role=>!bundle.roles.has(role)),complete=requiredRoles.length>0&&!missingRoles.length,uploadComplete=original===bundle.files.length&&bundle.files.length>0,ready=complete&&uploadComplete&&episodeMediaPending===0&&qc===bundle.files.length&&bundle.files.every(asset=>asset.status==='已通过')&&!issues.length&&!annotationPending.length,derivedStatus=ready?'可提交验收':!uploadComplete?'上传中':issues.length?'需处理':episodeMediaPending||!complete?'待补齐':qc<bundle.files.length?'待质检':annotationPending.length?'待标注':'待转换',status=ready&&stored.gateVersion==='episode-v2'&&['待验收','已验收','已归档'].includes(stored.status)?stored.status:derivedStatus;return {...bundle,...stored,issueCount:issues.length,annotationCount:annotations.length,annotationPending:annotationPending.length,episodeMediaPending,episodeCount:episodes.length||bundle.files.filter(asset=>asset.bundleRole==='trajectory').length,dataRecordCount:episodes.reduce((sum,asset)=>sum+Number(isSequenceAsset(asset)||isUmiSessionAsset(asset)?(asset.frameCount||asset.serverFile?.fileCount||1):1),0),requiredRoles,missingRoles,uploadComplete,original,qc,complete,ready,status}});
   }
   function intakeTemplate(){
     const snapshot=qualityHealthSnapshot(),packages=packageHealthRows(snapshot),assets=snapshot.assets,roles=['meta','trajectory','media'];
@@ -252,7 +333,7 @@
       [/div]
       [section class="panel"]
         [div class="panel-head"][div][div class="panel-title"]数据接入 / 入库审核[/div][div class="panel-sub"]参考采集数据工作台，按数据包查看来源、文件分组、Episode 规模和质量状态。</div>[/div]
-          [div class="row-actions"][button class="btn primary" id="intakeImport" type="button"][i data-lucide="folder-up"][/i]导入总文件夹[/button][button class="btn" id="intakeWorkflow" type="button"][i data-lucide="route"][/i]打开生产批次[/button][button class="btn" id="intakeRefresh" type="button"][i data-lucide="refresh-cw"][/i]刷新[/button][/div]
+          [div class="row-actions"][button class="btn primary" id="intakeImport" type="button"][i data-lucide="folder-up"][/i]浏览器上传[/button][button class="btn" id="intakeServerImport" type="button"][i data-lucide="hard-drive"][/i]服务端目录导入[/button][button class="btn" id="intakeWorkflow" type="button"][i data-lucide="route"][/i]打开生产批次[/button][button class="btn" id="intakeRefresh" type="button"][i data-lucide="refresh-cw"][/i]刷新[/button][/div]
         [/div]
         [div class="ext-toolbar"]
           [div class="search"][i data-lucide="search"][/i][input id="intakeSearch" placeholder="搜索数据包、场景、节点或任务" /][/div]
@@ -276,12 +357,33 @@
     renderIntakeRows();
     ['intakeSearch','intakeType','intakeStatus','intakeRole'].forEach(id=>document.getElementById(id)?.addEventListener(id==='intakeSearch'?'input':'change',renderIntakeRows));
     document.getElementById('intakeImport')?.addEventListener('click',startImportWizard);
+    document.getElementById('intakeServerImport')?.addEventListener('click',openServerDirectoryImport);
     document.getElementById('intakeWorkflow')?.addEventListener('click',()=>navigate('workflow',document.querySelector('.nav button[data-page="workflow"]')));
     document.getElementById('intakeRefresh')?.addEventListener('click',async event=>{const button=event.currentTarget;button.disabled=true;await syncServerState();moduleTemplates.intake=intakeTemplate();showPage('intake');showToast('数据接入状态已刷新');button.disabled=false});
   }
+  function openServerDirectoryImport(){
+    let box=document.getElementById('serverDirectoryDialog');
+    if(!box){box=document.createElement('div');box.id='serverDirectoryDialog';box.className='search-dialog';document.body.appendChild(box)}
+    box.innerHTML=m(`[div class="search-box" style="width:min(680px,calc(100vw - 30px))"][div class="popover-head"][span]服务端目录导入</span][button class="close" id="serverDirectoryClose"][i data-lucide="x"][/i][/button][/div][div style="padding:18px;display:grid;gap:14px"][div class="issue-evidence"][b]HDF5 帧序列按目录聚合[/b][span]每个包含 HDF5 帧文件的子目录视为一个 Episode，源文件保留在原位置，不复制到上传目录。[/span][/div][label]服务端目录路径[/label][input class="input" id="serverRootPath" style="width:100%" placeholder="例如：D:\\datasets\\matching_cable" /][div class="form-row"][div][label]数据包名称[/label][input class="input" id="serverBundleName" style="width:100%" placeholder="留空时使用目录名称" /][/div][div][label]数据类型[/label][select class="select" id="serverDataType" style="width:100%">${DATA_TYPES.map(type=>`[option value="${type}"${type==='遥操'?' selected':''}]${type}[/option]`).join('')}[/select][/div][/div][div class="form-row"][div][label]采集场景[/label][input class="input" id="serverScene" style="width:100%" placeholder="例如：线缆装配" /][/div][div][label]执行方式[/label][input class="input" style="width:100%" value="只登记目录索引，不发起逐文件浏览器上传" disabled /][/div][/div][p id="serverImportStatus" role="status" aria-live="polite" style="margin:0;color:var(--muted)"></p][div class="modal-foot" style="padding:6px 0 0"][button class="btn" id="serverImportCancel"]取消[/button][button class="btn primary" id="serverImportSubmit"][i data-lucide="scan-folder"][/i]扫描并登记[/button][/div][/div]`);lucide.createIcons();
+    box.classList.add('show');
+    const importEvidence=box.querySelector('.issue-evidence');importEvidence.querySelector('b').textContent='UMI Session / HDF5 帧序列';importEvidence.querySelector('span').textContent='选择 UMI 时按 session_* 自动聚合并保留源文件；选择遥操时按 HDF5 帧目录聚合。';
+    const close=()=>box.classList.remove('show');
+    document.getElementById('serverDirectoryClose').onclick=close;document.getElementById('serverImportCancel').onclick=close;
+    box.onclick=event=>{if(event.target===box)close()};
+    document.getElementById('serverRootPath').focus();
+    document.getElementById('serverImportSubmit').onclick=async event=>{
+      const button=event.currentTarget,rootPath=document.getElementById('serverRootPath').value.trim(),bundleName=document.getElementById('serverBundleName').value.trim(),type=document.getElementById('serverDataType').value,scene=document.getElementById('serverScene').value.trim(),status=document.getElementById('serverImportStatus');
+      if(!rootPath){showToast('请输入服务端目录路径');return}
+      button.disabled=true;status.textContent='正在扫描目录并聚合 Episode，不复制源文件…';
+      try{
+        const response=await rawFetch('/api/imports/server-directory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rootPath,bundleName,type,scene,preset:'auto'})}),data=await response.json();if(!response.ok)throw new Error(data.error||'服务端目录导入失败');
+        await syncServerState();close();moduleTemplates.intake=intakeTemplate();showPage('intake');showToast(data.createdCount===0?`目录已识别 ${data.scan.episodeCount} 个 Episode，均已登记，无需重复导入`:`已新增 ${data.createdCount} 个 Episode · 目录共 ${data.scan.episodeCount} 个 Episode · ${data.scan.mode==='umi-session'?`${data.scan.frameCount||0} 个 RGB 帧`:`${data.scan.fileCount} 个 HDF5 帧`} · ${formatBytes(data.scan.totalBytes)}`)
+      }catch(error){status.textContent=error.message;showToast(error.message)}finally{button.disabled=false}
+    };
+  }
   function bundleBlockers(item){
     const blockers=[];
-    if(!item.complete)blockers.push(`缺少 ${['meta','trajectory','media'].filter(role=>!item.roles?.has?.(role)&&!item.roles?.includes?.(role)).map(role=>role==='trajectory'?'data':role).join('、')||'数据分组'}`);
+    if(!item.complete)blockers.push(`缺少 ${(item.missingRoles||[]).map(role=>role==='trajectory'?'data':role).join('、')||'必需数据分组'}`);
     if(item.original<item.files.length)blockers.push(`原始文件 ${item.original}/${item.files.length}`);
     if(item.qc<item.files.length)blockers.push(`缺少当前版本完整检查 ${item.files.length-item.qc} 个文件`);
     if(item.files.some(asset=>asset.status!=='已通过'))blockers.push(`${item.files.filter(asset=>asset.status!=='已通过').length} 个文件尚未通过质检`);
@@ -328,22 +430,54 @@
     box.classList.add('show');lucide.createIcons();
     const close=()=>box.classList.remove('show');document.getElementById('healthDetailClose').onclick=close;document.getElementById('healthDetailCancel').onclick=close;document.getElementById('healthDetailQc').onclick=()=>{close();navigate('qc',document.querySelector('.nav button[data-page="qc"]'))};box.querySelectorAll('[data-bundle-status]').forEach(button=>button.onclick=()=>updateBundleStatus(button.dataset.bundleId,button.dataset.bundleStatus));box.querySelectorAll('tbody tr').forEach(row=>{const id=row.querySelector('small')?.textContent?.trim(),cell=row.lastElementChild;if(!id||!cell||cell.querySelector('[data-bundle-report]'))return;const button=document.createElement('button');button.className='btn';button.dataset.bundleReport=id;button.title='下载数据包验收报告';button.innerHTML='<i data-lucide="file-check-2"></i>报告';button.onclick=async()=>{button.disabled=true;try{const response=await fetch(`/api/bundles/${encodeURIComponent(id)}/report`,{cache:'no-store'});if(!response.ok){const data=await response.json().catch(()=>({}));throw new Error(data.error||'验收报告生成失败')}const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`${id}-acceptance-report.json`;link.click();URL.revokeObjectURL(url)}catch(error){showToast(error.message)}finally{button.disabled=false}};cell.appendChild(button)});lucide.createIcons();
   }
+  function formatDurationSeconds(value){const seconds=Math.max(0,Math.round(Number(value)||0));return `${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,'0')}`}
+  function episodeVideoSources(asset,index,assets=getAssets()){return assets.filter(item=>item.bundleId===asset.bundleId&&item.bundleRole==='media'&&item.serverFile&&new RegExp(`episode_0*${index}(?:\\D|$)`,'i').test(item.relativePath||item.name))}
   function getEpisodes(){
-    return getAssets().filter(asset=>asset.bundleRole==='trajectory'&&/episode_\d+\.parquet$/i.test(asset.relativePath||asset.name)).map(asset=>{
-      const index=Number(/episode_(\d+)\.parquet$/i.exec(asset.relativePath||asset.name)[1]);
-      return {id:`${asset.bundleId}:EP-${String(index).padStart(6,'0')}`,assetId:asset.id,bundleId:asset.bundleId,episodeIndex:index,type:asset.type,scene:asset.scene,task:asset.bundleName||asset.name,duration:'--',frames:asset.serverFile?.contentCheck?.recordCount??'--',score:asset.lastQcAt?asset.score:0,status:asset.status||'待质检'};
+    const assets=getAssets();
+    return assets.filter(isLogicalEpisodeAsset).map(asset=>{
+      const index=episodeIndexForAsset(asset),frames=Number(asset.frameCount??asset.serverFile?.contentCheck?.recordCount??0)||null,preview=episodePreviewStates.get(asset.id)||null,videoSources=episodeVideoSources(asset,index,assets),generatedPreview=isSequenceAsset(asset)||isUmiSessionAsset(asset),externalVideo=!generatedPreview&&videoSources.length>0,fps=Number(asset.inspection?.production?.hdf5?.sequence?.observedFps||asset.inspection?.production?.umi?.metrics?.cameraFps||preview?.preview?.fps||asset.mediaMetadata?.fps||20),duration=preview?.preview?.durationSeconds??(frames&&fps?frames/fps:null);
+      return {id:`${asset.bundleId}:EP-${String(index??0).padStart(6,'0')}`,assetId:asset.id,bundleId:asset.bundleId,episodeIndex:index,type:asset.type,scene:asset.scene,task:asset.bundleName||asset.name,duration:duration?formatDurationSeconds(duration):'--',durationSeconds:duration||null,frames:frames||'--',score:asset.lastQcAt?asset.score:0,status:asset.status||'待质检',externalVideo,generatedPreview,previewStatus:preview?.status||(externalVideo?'ready':'not_generated'),preview:preview?.preview||null,previewMessage:preview?.message||''};
     });
+  }
+  async function refreshEpisodePreviewStates(poll=true){
+    const assets=getAssets().filter(asset=>isSequenceAsset(asset)||isUmiSessionAsset(asset)),ids=assets.map(asset=>asset.id);
+    if(!ids.length)return;
+    try{
+      const response=await rawFetch(`/api/episodes/previews?assetIds=${encodeURIComponent(ids.join(','))}`,{cache:'no-store'});if(!response.ok)return;
+      const data=await response.json(),next=new Map();
+      (data.previews||[]).forEach(item=>next.set(item.assetId,item));episodePreviewStates=next;
+      if(document.getElementById('episodeRows')){renderEpisodeRows();updateEpisodePreviewKpis()}
+      for(const id of [...episodePreviewOpenAfter]){const state=episodePreviewStates.get(id);if(state?.status==='ready'){episodePreviewOpenAfter.delete(id);openEpisode(`${next.get(id)?.bundleId||getAssets().find(asset=>asset.id===id)?.bundleId}:EP-${String(episodeIndexForAsset(getAssets().find(asset=>asset.id===id))??0).padStart(6,'0')}`)}}
+      const active=[...next.values()].some(item=>['queued','running'].includes(item.status));
+      clearTimeout(episodePreviewPollTimer);
+      if(poll&&active)episodePreviewPollTimer=setTimeout(()=>refreshEpisodePreviewStates(true),1500);
+    }catch(error){console.warn('[episode-preview-status]',error.message)}
+  }
+  function updateEpisodePreviewKpis(){
+    const episodes=getEpisodes(),playable=episodes.filter(item=>item.previewStatus==='ready').length,box=document.getElementById('episodePlayableKpi');if(box)box.textContent=String(playable);
+  }
+  async function requestEpisodePreview(assetId,openAfter=false){
+    const state=episodePreviewStates.get(assetId);
+    if(state?.status==='ready'){if(openAfter)openEpisode(`${getAssets().find(asset=>asset.id===assetId)?.bundleId}:EP-${String(episodeIndexForAsset(getAssets().find(asset=>asset.id===assetId))??0).padStart(6,'0')}`);return state.preview}
+    if(['queued','running'].includes(state?.status)){if(openAfter)episodePreviewOpenAfter.add(assetId);showToast('预览任务已在队列中');return null}
+    episodePreviewStates.set(assetId,{assetId,status:'queued',completed:0,total:0,message:'等待生成预览'});renderEpisodeRows();
+    try{
+      const response=await rawFetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'preview',payload:{assetId}})}),data=await response.json();if(!response.ok)throw new Error(data.error||'预览任务创建失败');
+      episodePreviewStates.set(assetId,{assetId,status:data.job.status,jobId:data.job.id,completed:Number(data.job.completed||0),total:Number(data.job.total||0),message:data.job.message||'等待生成预览'});
+      if(openAfter)episodePreviewOpenAfter.add(assetId);renderEpisodeRows();await refreshBackgroundJobs();await refreshEpisodePreviewStates(false);if(!episodePreviewPollTimer)episodePreviewPollTimer=setTimeout(()=>refreshEpisodePreviewStates(true),1200);showToast('Episode 预览已进入后台任务');return null;
+    }catch(error){episodePreviewStates.set(assetId,{assetId,status:'failed',message:error.message});renderEpisodeRows();showToast(error.message);return null}
   }
   function normalizeAsset(asset,index){
     const score=Number(asset.score||0),type=DATA_TYPES.includes(asset.type)?asset.type:'待确认';
     const normalizedStatus=type==='待确认'?'待确认类型':asset.status||(score?(score>=90?'已通过':'待复核'):'待质检');
-    return {id:asset.id||'AST-'+String(index+1).padStart(4,'0'),name:asset.name,type,scene:asset.scene||'本地导入',format:asset.format||'RAW',size:asset.size||0,records:asset.records??'已接入',node:asset.node||'本地导入',taskId:asset.taskId||'',taskName:asset.taskName||'',model:asset.model||'未关联',qcTemplate:asset.qcTemplate||'标准质检',annotationStatus:asset.annotationStatus||'未标注',createdAt:asset.createdAt||nowLabel(),score,status:normalizedStatus,lastQcAt:asset.lastQcAt||'',inspection:asset.inspection||null,mediaMetadata:asset.mediaMetadata||null,bundleId:asset.bundleId||'',bundleName:asset.bundleName||'',bundlePreset:asset.bundlePreset||'',bundleRole:asset.bundleRole||'',bundleRoleLabel:asset.bundleRoleLabel||'',bundleFileIndex:asset.bundleFileIndex||0,bundleFileCount:asset.bundleFileCount||0,relativePath:asset.relativePath||asset.name||'',sourceRoot:asset.sourceRoot||'',sourceFolder:asset.sourceFolder||'',isDemo:Boolean(asset.isDemo),serverFile:asset.serverFile||null,serverManaged:Boolean(asset.serverManaged)};
+    return {id:asset.id||'AST-'+String(index+1).padStart(4,'0'),name:asset.name,type,scene:asset.scene||'本地导入',format:asset.format||'RAW',size:asset.size||0,records:asset.records??'已接入',node:asset.node||'本地导入',taskId:asset.taskId||'',taskName:asset.taskName||'',model:asset.model||'未关联',qcTemplate:asset.qcTemplate||'标准质检',annotationStatus:asset.annotationStatus||'未标注',createdAt:asset.createdAt||nowLabel(),score,status:normalizedStatus,lastQcAt:asset.lastQcAt||'',inspection:asset.inspection||null,mediaMetadata:asset.mediaMetadata||null,bundleId:asset.bundleId||'',bundleName:asset.bundleName||'',bundlePreset:asset.bundlePreset||'',bundleRole:asset.bundleRole||'',bundleRoleLabel:asset.bundleRoleLabel||'',bundleFileIndex:asset.bundleFileIndex||0,bundleFileCount:asset.bundleFileCount||0,relativePath:asset.relativePath||asset.name||'',sourceRoot:asset.sourceRoot||'',sourceFolder:asset.sourceFolder||'',sourceDirectory:asset.sourceDirectory||'',episodeIndex:Number.isInteger(Number(asset.episodeIndex))?Number(asset.episodeIndex):null,frameCount:Number.isFinite(Number(asset.frameCount))?Number(asset.frameCount):null,isDemo:Boolean(asset.isDemo),serverFile:asset.serverFile||null,serverManaged:Boolean(asset.serverManaged)};
   }
-  function getAllAssets(){return extRead(storageKey.assets).map(normalizeAsset)}
+  let assetCache=null,currentAssetFilteredIds=[],assetRenderLimit=300;
+  function getAllAssets(){if(!assetCache)assetCache=extRead(storageKey.assets).map(normalizeAsset);return assetCache}
   function getAssets(){return getAllAssets().filter(asset=>!asset.isDemo)}
   function findAsset(name){return getAssets().find(item=>item.name===name)}
   function daysFromNow(){return new Date().toLocaleString('zh-CN',{hour12:false})}
-  function saveAssets(list){extWrite(storageKey.assets,list.map((item,index)=>normalizeAsset(item,index)))}
+  function saveAssets(list){assetCache=list.map((item,index)=>normalizeAsset(item,index));extWrite(storageKey.assets,assetCache.slice(-500))}
   function ensureAssets(){
     const existing=getAssets();
     if(!existing.length)saveAssets([]);
@@ -351,9 +485,17 @@
   }
   function getModels(){const assets=getAssets();return [...new Set(assets.map(asset=>asset.model).filter(model=>model&&model!=='未关联'))].map(id=>({id,type:assets.find(asset=>asset.model===id)?.type||'待确认'}))}
   function modelOf(name){return getModels().find(model=>model.id===name)}
+  const NAV_GROUPS={
+    batch:{label:'批次总览',icon:'layout-dashboard',default:'overview',items:[['overview','批次概览'],['workflow','批次处理'],['intake','数据接入'],['annotation','标注与审核']]},
+    data:{label:'数据浏览',icon:'database',default:'assets',items:[['assets','数据资产'],['episodes','Episode 浏览']]},
+    diagnostics:{label:'运行诊断',icon:'activity',default:'jobs',items:[['jobs','任务中心'],['qc','质量检测'],['issues','问题中心'],['runs','运行记录']]},
+    delivery:{label:'交付核验',icon:'package-check',default:'exports',items:[['exports','导出与交付'],['datasets','数据集版本']]},
+    admin:{label:'系统管理',icon:'settings-2',default:'tasks',items:[['tasks','采集任务'],['nodes','采集节点'],['quality','质量规则'],['users','成员与权限'],['audit','审计日志']]}
+  };
+  const PAGE_GROUP={overview:'batch',workflow:'batch',intake:'batch',annotation:'batch',assets:'data',episodes:'data',jobs:'diagnostics',qc:'diagnostics',issues:'diagnostics',runs:'diagnostics',exports:'delivery',datasets:'delivery',tasks:'admin',nodes:'admin',quality:'admin',users:'admin',audit:'admin'};
   function installNavigation(){
-    Object.assign(pageNames,{intake:['数据接入','参考采集数据工作台，管理总文件夹导入、入库审核和数据包分组。'],workflow:['生产批次','导入、检查、问题处理、标注审核、验收和交付集中推进。'],qc:['质量检测中心','选择检测范围与规则模板，执行质检并查看报告与问题明细。'],runs:['运行记录','查看每次质检运行的证据摘要。'],episodes:['Episode 浏览','查看轨迹、对应视频、质检状态和标注。'],annotation:['标注与审核','选择任务或数据集，维护一次统一标准；自动保存、批量送审并集中处理异常。'],jobs:['任务中心','统一查看后台执行任务、业务待办、失败重试和执行日志。'],exports:['导出与交付','统一转换为 LeRobot v2.1，生成交付目录、Manifest、校验证据和标注 JSONL。'],nodes:['采集节点','查看已登记节点的连接状态、容量和版本。'],audit:['审计日志','追踪数据、规则、审核和导出操作。']});
-    pageNames.overview=['质量总览','查看 UMI、EGO、遥操资产的质检证据、问题与批次进度。'];
+    Object.assign(pageNames,{intake:['数据接入','参考采集数据工作台，管理总文件夹导入、入库审核和数据包分组。'],workflow:['生产批次','导入、检查、问题处理、标注审核、验收和交付集中推进。'],qc:['质量检测中心','选择检测范围与规则模板，执行质检并查看报告与问题明细。'],runs:['运行记录','查看每次质检运行的证据摘要。'],episodes:['Episode 浏览','查看轨迹、对应视频、质检状态和标注。'],annotation:['标注与审核','选择任务或数据集，维护一次统一标准；自动保存、批量送审并集中处理异常。'],jobs:['任务中心','按生产任务和数据包查看上传、清洗、质检、标注、转换进度及后台执行记录。'],exports:['导出与交付','统一转换为 LeRobot v3.0 训练交付，执行官方加载与独立验包，并生成 Manifest、校验证据和标注 JSONL。'],nodes:['采集节点','查看已登记节点的连接状态、容量和版本。'],audit:['审计日志','追踪数据、规则、审核和导出操作。']});
+    pageNames.overview=['批次总览','查看批次导入、质检、标注、验收与交付的整体进度。'];
     const make=(page,icon,label)=>{const button=document.createElement('button');button.dataset.page=page;button.innerHTML=m(`[i data-lucide="${icon}"][/i][span]${label}[/span]`);button.onclick=()=>navigate(page,button);return button};
     const primary=document.querySelectorAll('.nav')[0];
     primary.insertBefore(make('intake','folder-input','数据接入'),primary.children[1]);
@@ -364,20 +506,37 @@
     const admin=document.querySelectorAll('.nav')[1];
     admin.insertBefore(make('nodes','radio-tower','采集节点'),admin.children[1]);
     admin.insertBefore(make('audit','scroll-text','审计日志'),admin.lastElementChild);
+    const primaryNav=document.querySelectorAll('.nav')[0],adminNav=document.querySelectorAll('.nav')[1];
+    primaryNav.innerHTML='';adminNav.innerHTML='';
+    const makeGroup=(key,group)=>{const button=document.createElement('button');button.dataset.navGroup=key;button.dataset.page=group.default;button.innerHTML=m(`[i data-lucide=${group.icon}][/i][span]${group.label}[/span]`);button.onclick=()=>navigate(group.default,button);return button};
+    ['batch','data','diagnostics','delivery'].forEach(key=>primaryNav.appendChild(makeGroup(key,NAV_GROUPS[key])));
+    adminNav.appendChild(makeGroup('admin',NAV_GROUPS.admin));
+    const content=document.querySelector('.content'),context=document.createElement('div');
+    context.id='contextNav';context.className='context-nav';content.firstElementChild.insertAdjacentElement('afterend',context);
+    document.getElementById('pageTitle').textContent=pageNames.overview[0];document.getElementById('crumbCurrent').textContent=pageNames.overview[0];document.getElementById('pageDesc').textContent=pageNames.overview[1];
+    renderContextNavigation('overview');
+  }
+  function renderContextNavigation(key){
+    const groupKey=PAGE_GROUP[key]||'batch',group=NAV_GROUPS[groupKey],context=document.getElementById('contextNav');if(!group||!context)return;
+    document.querySelectorAll('[data-nav-group]').forEach(item=>item.classList.toggle('active',item.dataset.navGroup===groupKey));
+    const counts={assets:'assetNavCount',issues:'issueNavCount',quality:'ruleNavCount'};
+    context.innerHTML=group.items.map(([page,label])=>`<button type=button data-context-page=${page} class=${page===key?'active':''}>${label}${counts[page]?`<span class=count id=${counts[page]}>0</span>`:''}</button>`).join('');
+    context.querySelectorAll('[data-context-page]').forEach(item=>item.onclick=()=>navigate(item.dataset.contextPage,item));
+    const setCount=(id,value)=>{const node=document.getElementById(id);if(node)node.textContent=String(value)};setCount('assetNavCount',getAssets().filter(asset=>!asset.isDemo).length);setCount('issueNavCount',extRead('embodiedIssues',[]).filter(issue=>issue.status!=='已关闭').length);setCount('ruleNavCount',extRead('embodiedQualityRules',[]).filter(rule=>rule.enabled!==false).length);
+    lucide.createIcons();
   }
   function navigate(key,button){
     const required=PAGE_ACCESS[key]||[];
     if(authUser&&required.length&&!can(...required)){showToast('当前角色无权访问该模块');key='overview';button=document.querySelector('.nav button[data-page="overview"]')}
-    document.querySelectorAll('.nav button').forEach(item=>item.classList.remove('active'));
-    if(button)button.classList.add('active');
+    renderContextNavigation(key);
     const page=pageNames[key]||pageNames.overview;
     document.getElementById('pageTitle').textContent=page[0];
     document.getElementById('crumbCurrent').textContent=page[0];
     document.getElementById('pageDesc').textContent=page[1];
-    showPage(key);
+    showPage(key);renderContextNavigation(key);
   }
   function workflowStages(selected,assets,openIssues,batches,exportsList,accepted,delivered){
-    const episodes=assets.filter(asset=>asset.bundleRole==='trajectory'&&/episode_\d+\.parquet$/i.test(asset.relativePath||asset.name)),annotations=extRead('embodiedAnnotations',[]).filter(item=>episodes.some(asset=>asset.id===item.assetId)),annotationComplete=episodes.length>0&&episodes.every(asset=>annotationGroupApproved(asset)),approved=episodes.filter(asset=>annotationGroupApproved(asset)).length;
+    const episodes=assets.filter(isLogicalEpisodeAsset),annotations=extRead('embodiedAnnotations',[]).filter(item=>episodes.some(asset=>asset.id===item.assetId)),annotationComplete=episodes.length>0&&episodes.every(asset=>annotationGroupApproved(asset)),approved=episodes.filter(asset=>annotationGroupApproved(asset)).length;
     const cleanCount=assets.filter(asset=>asset.serverFile&&asset.inspection?.empty!==true&&asset.serverFile.contentCheck?.valid!==false&&asset.serverFile.deepCheck?.status!=='invalid').length;
     const assetIds=new Set(assets.map(asset=>asset.id)),cleanDone=assets.length>0&&cleanCount===assets.length,qcDone=assets.length>0&&assets.every(item=>item.lastQcAt),reviewDone=annotationComplete&&approved===episodes.length,issueDone=qcDone&&openIssues.length===0&&reviewDone,latestBatch=batches.find(batch=>Array.isArray(batch.targetIds)&&batch.targetIds.some(id=>assetIds.has(id))),latestExport=exportsList.find(job=>selected&&((job.batchId===selected.id)||(job.batchIds||[]).includes(selected.id))),convertDone=Boolean(latestExport?.format),deliverDone=Boolean(latestExport&&latestExport.status==='清单就绪');
     return [
@@ -400,7 +559,7 @@
     const snapshot=qualityHealthSnapshot(),packages=packageHealthRows(snapshot),selected=packages.find(item=>item.id===activeWorkflowBundleId)||packages[0];
     activeWorkflowBundleId=selected?.id||'';
     const assets=selected?.files||[],ids=new Set(assets.map(asset=>asset.id)),issues=snapshot.openIssues.filter(issue=>ids.has(issue.assetId)),groups=annotationGroupsLocal().filter(group=>group.bundleIds?.includes(selected?.id)||group.key===selected?.id||group.key===`BUNDLE:${selected?.id}`||assets.some(asset=>asset.taskId&&group.key===`TASK:${asset.taskId}`));
-    const episodes=assets.filter(asset=>asset.bundleRole==='trajectory'&&/episode_\d+\.parquet$/i.test(asset.relativePath||asset.name));
+    const episodes=assets.filter(isLogicalEpisodeAsset);
     const annotations=extRead('embodiedAnnotations',[]).filter(annotation=>episodes.some(asset=>asset.id===annotation.assetId));
     const checked=assets.length>0&&assets.every(asset=>asset.lastQcAt&&asset.inspection?.production?.sha256===asset.serverFile?.sha256),passed=checked&&assets.every(asset=>asset.status==='已通过'),filled=episodes.length>0&&annotations.length===episodes.length&&annotations.every(annotation=>String(annotation.instruction||'').trim()),reviewed=episodes.length>0&&episodes.every(asset=>annotationGroupApproved(asset)),accepted=selected?.status==='已验收'||selected?.status==='已归档';
     const exportsList=extRead('embodiedExports',[]),output=exportsList.find(job=>job.batchId===selected?.id||(job.batchIds||[]).includes(selected?.id)),delivered=Object.values(output?.conversions||{}).some(value=>value.ok&&value.current!==false&&value.independentVerification?.ok),blocked=selected?bundleBlockers(selected):['请导入一个数据集总文件夹'];
@@ -423,7 +582,7 @@
       <details class="production-details"><summary>V6 高级流程与未接入节点</summary><div id="batchV6Details"></div></details>
       <details class="production-details"><summary>批次证据与门禁明细</summary><p>批次：${escapeHtml(selected?.id||'--')} · 原始文件 ${assets.filter(asset=>asset.serverFile).length}/${assets.length} · 最近检查 ${escapeHtml(latestQc?.id||'未执行')} · 标注审核 ${reviewed?'已通过':'未通过'} · 当前交付 ${escapeHtml(output?.id||'未建立')}</p><p>证据通过后台任务持久保存，刷新或断网不会清空任务。检查失败和未接入能力会保留明确状态。</p></details></section>`;
   }
-  async function workflowQc(){const snapshot=qualityHealthSnapshot(),packages=packageHealthRows(snapshot),selected=packages.find(item=>item.id===activeWorkflowBundleId),targets=selected?.files||[],ids=targets.filter(item=>item.serverFile).map(item=>item.id);if(!targets.length){showToast('请先导入一个生产批次');return}if(!ids.length){showToast('当前批次已全部执行质检；可重新质检来验证修复结果');return}try{const batch=await createQcBatch('当前生产批次','标准质检','全部模型',ids);if(batch){await syncServerState();moduleTemplates.workflow=workflowTemplate();showPage('workflow');showToast(`当前批次质检完成：通过率 ${batch.passRate}%，发现 ${batch.issueCount} 个问题`)} }catch(error){showToast(error.message)}}
+  async function workflowQc(){const snapshot=qualityHealthSnapshot(),packages=packageHealthRows(snapshot),selected=packages.find(item=>item.id===activeWorkflowBundleId),targets=selected?.files||[],ids=targets.filter(item=>item.serverFile).map(item=>item.id),uploadPending=targets.filter(item=>!item.serverFile).length;if(!targets.length){showToast('请先导入一个生产批次');return}if(uploadPending){showToast(`原始文件仍有 ${uploadPending} 个未上传完成，完成后才能进入质检`);return}if(!ids.length){showToast('当前批次已全部执行质检；可重新质检来验证修复结果');return}try{const batch=await createQcBatch('当前生产批次','标准质检','全部模型',ids);if(batch){await syncServerState();moduleTemplates.workflow=workflowTemplate();showPage('workflow');showToast(`当前批次质检完成：通过率 ${batch.passRate}%，发现 ${batch.issueCount} 个问题`)} }catch(error){showToast(error.message)}}
   async function workflowDeepCheck(){const snapshot=qualityHealthSnapshot(),item=packageHealthRows(snapshot).find(row=>row.id===activeWorkflowBundleId),deep=snapshot.openIssues.filter(issue=>item?.files.some(asset=>asset.id===issue.assetId)&&issue.metric==='语义深度解析'),assetIds=[...new Set(deep.map(issue=>issue.assetId))];if(!assetIds.length){showToast('当前批次没有待执行的 LeRobot 深度校验');return}const button=document.getElementById('workflowDeepCheck');if(button)button.disabled=true;try{const response=await fetch('/api/assets/lerobot-deep-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({assetIds,template:'标准质检'})}),data=await response.json();if(!response.ok)throw new Error(data.error||'LeRobot 深度校验失败');if(data.assets)saveAssets(data.assets);extWrite('embodiedIssues',data.issues||[]);if(data.batch)extWrite('embodiedQcBatches',[data.batch,...extRead('embodiedQcBatches',[]).filter(row=>row.id!==data.batch.id)].slice(0,100));extWrite('embodiedRuns',data.runs||extRead('embodiedRuns',[]));await syncServerState();moduleTemplates.workflow=workflowTemplate();showPage('workflow');const pluginSummary=(data.embodied||[]).map(report=>`${report.detection?.format||'dataset'} ${report.info?.episodes??'?'} Episode · ${report.validation?.score??'?'} 分`).join('；');showToast(`深度校验完成：解析 ${assetIds.length} 个 Parquet${pluginSummary?`；Embodied Data：${pluginSummary}`:''}，当前仍有 ${(data.issues||[]).filter(issue=>deep.some(item=>item.id===issue.id)).length} 条相关问题`)}catch(error){showToast(error.message)}finally{if(button)button.disabled=false}}
   async function workflowAcceptance(){const snapshot=qualityHealthSnapshot(),item=packageHealthRows(snapshot).find(row=>row.id===activeWorkflowBundleId);if(!item){showToast('请先选择一个已导入的数据包');return}if(['已验收','已归档'].includes(item.status)){showToast(`批次${item.status}，不能重复变更。下一步请进入 LeRobot 格式转换`);return}const next=item.status==='可提交验收'?'待验收':item.status==='待验收'?'已验收':'';if(!next){showToast(`当前批次状态为“${item.status}”，尚不能提交或签署验收`);return}if(next==='待验收'&&!item.ready){showToast(`当前批次尚未达到验收门禁：${bundleBlockers(item).join('；')}`);return}if(next==='已验收'&&authUser?.role!=='数据治理负责人'){showToast('只有数据治理负责人可以签署批次验收');return}try{const response=await fetch('/api/bundles/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:item.id,status:next,note:next==='已验收'?'生产批次工作台签署验收':'生产批次工作台提交验收'})}),data=await response.json();if(!response.ok)throw new Error(data.error||'批次验收状态更新失败');extWrite('embodiedBundles',data.bundles||[]);await syncServerState();moduleTemplates.workflow=workflowTemplate();showPage('workflow');showToast(next==='已验收'?'批次验收已签署，下一步进入 LeRobot 格式转换':'批次已提交验收，等待负责人签署')}catch(error){showToast(error.message)}}
   async function workflowExport(){const snapshot=qualityHealthSnapshot(),item=packageHealthRows(snapshot).find(row=>row.id===activeWorkflowBundleId),name=`${item?.name||'Embodied-Quality'}-交付-${new Date().toISOString().slice(0,10)}`,assetIds=item?.files.map(asset=>asset.id);try{const response=await fetch('/api/exports',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,assetIds,format:'LeRobot',contents:['原始文件','质量报告','标注清单'],user:authUser?.name||'当前用户'})}),data=await response.json();if(!response.ok)throw new Error(data.error||'交付清单生成失败');extWrite('embodiedExports',data.exports||[]);await syncServerState();moduleTemplates.workflow=workflowTemplate();showPage('workflow');showToast(`当前批次交付 Manifest 已生成：${data.job.id}`)}catch(error){showToast(error.message)}}
@@ -440,35 +599,39 @@
     document.querySelectorAll('[data-batch-issue]').forEach(button=>button.onclick=()=>openIssueEditor(button.dataset.batchIssue));
     const deepCheck=document.getElementById('workflowDeepCheck');if(deepCheck)deepCheck.onclick=workflowDeepCheck;
   }
-  function episodeTemplate(){const episodes=getEpisodes(),playable=episodes.filter(item=>getAssets().some(asset=>asset.bundleId===item.bundleId&&asset.bundleRole==='media'&&new RegExp(`episode_0*${item.episodeIndex}(?:\\D|$)`,'i').test(asset.relativePath||asset.name)&&asset.serverFile)).length,pending=episodes.filter(item=>['待深检','待复核','待质检'].includes(item.status)).length,blocked=episodes.filter(item=>item.status!=='已通过').length;return m(`
+  function episodeTemplate(){const episodes=getEpisodes(),playable=episodes.filter(item=>item.previewStatus==='ready').length,pending=episodes.filter(item=>['待深检','待复核','待质检'].includes(item.status)).length,blocked=episodes.filter(item=>item.status!=='已通过').length;return m(`
     [div class="ext-kpis"]
       [div class="ext-kpi"][span]已登记 Episode[/span][b]${episodes.length}[/b][small]已排除演示资产[/small][/div]
-      [div class="ext-kpi"][span]可播放视频[/span][b]${playable}[/b][small]原始视频已存入服务端[/small][/div]
+      [div class="ext-kpi"][span]可播放预览[/span][b id="episodePlayableKpi"]${playable}[/b][small]四路 HDF5 或原始视频已就绪[/small][/div]
       [div class="ext-kpi"][span]待人工复核[/span][b]${pending}[/b][small]待深检、待复核或待质检[/small][/div]
       [div class="ext-kpi"][span]质量门禁拦截[/span][b]${blocked}[/b][small]待补传或存在高优先级问题[/small][/div]
     [/div]
     [section class="panel"]
-      [div class="panel-head"][div][div class="panel-title"]Episode 与轨迹浏览[/div][div class="panel-sub"]查看真实轨迹、对应视频和已有质检证据[/div][/div][button class="btn primary" id="runQcBtn"][i data-lucide="play-circle"][/i]运行批量质检[/button][/div]
+      [div class="panel-head"][div][div class="panel-title"]Episode 与轨迹浏览[/div][div class="panel-sub"]查看真实轨迹、四路同步预览和已有质检证据[/div][/div][div class="row-actions"][button class="btn" id="generateAllPreviews"][i data-lucide="images"][/i]生成全部预览[/button][button class="btn primary" id="runQcBtn"][i data-lucide="play-circle"][/i]运行批量质检[/button][/div][/div]
       [div class="ext-toolbar"]
         [div class="search"][i data-lucide="search"][/i][input id="episodeSearch" placeholder="搜索 Episode、场景或任务" /][/div]
         [select class="filter-select" id="episodeType"][option value="all"]全部类型[/option][option]UMI[/option][option]EGO[/option][option]遥操[/option][/select]
         [select class="filter-select" id="episodeStatus"][option value="all"]全部状态[/option][option]已通过[/option][option]待深检[/option][option]待补传[/option][option]问题[/option][option]待质检[/option][/select]
         [span class="spacer"][/span][button class="btn" id="episodeExport"][i data-lucide="download"][/i]导出筛选结果[/button]
       [/div]
-      [div class="table-scroll"][table class="module-table ext-table"][thead][tr][th]Episode[/th][th]类型[/th][th]场景 / 任务[/th][th]时长[/th][th]帧数[/th][th]质量分[/th][th]状态[/th][/tr][/thead][tbody id="episodeRows"][/tbody][/table][/div]
+      [div class="table-scroll"][table class="module-table ext-table"][thead][tr][th]Episode[/th][th]预览[/th][th]类型[/th][th]场景 / 任务[/th][th]时长[/th][th]帧数[/th][th]质量分[/th][th]状态[/th][/tr][/thead][tbody id="episodeRows"][/tbody][/table][/div]
     [/section]`)}
   function renderEpisodeRows(){
     const body=document.getElementById('episodeRows');if(!body)return;
     const query=(document.getElementById('episodeSearch')?.value||'').toLowerCase(),type=document.getElementById('episodeType')?.value||'all',status=document.getElementById('episodeStatus')?.value||'all';
     const rows=getEpisodes().filter(ep=>(type==='all'||ep.type===type)&&(status==='all'||ep.status===status)&&(`${ep.id} ${ep.scene} ${ep.task}`.toLowerCase().includes(query)));
-    body.innerHTML=rows.length?rows.map(ep=>m(`[tr data-id="${escapeHtml(ep.id)}"][td]${escapeHtml(ep.id)}[/td][td]${typeBadge(ep.type)}[/td][td][b]${escapeHtml(ep.scene)}[/b][br][small]${escapeHtml(ep.task)}[/small][/td][td]${ep.duration}[/td][td]${escapeHtml(ep.frames)}[/td][td][span class="quality-score ${scoreClass(ep.score)}"]${ep.score?ep.score.toFixed(1):'--'}[/span][/td][td]${statusBadge(ep.status)}[/td][/tr]`)).join(''):m('[tr][td colspan="7"][div class="empty-inline"]没有符合条件的 Episode[/div][/td][/tr]');
+    body.innerHTML=rows.length?rows.map(ep=>m(`[tr data-id="${escapeHtml(ep.id)}"][td]${escapeHtml(ep.id)}[/td][td]${episodePreviewAction(ep)}[/td][td]${typeBadge(ep.type)}[/td][td][b]${escapeHtml(ep.scene)}[/b][br][small]${escapeHtml(ep.task)}[/small][/td][td]${ep.duration}[/td][td]${escapeHtml(ep.frames)}[/td][td][span class="quality-score ${scoreClass(ep.score)}"]${ep.score?ep.score.toFixed(1):'--'}[/span][/td][td]${statusBadge(ep.status)}[/td][/tr]`)).join(''):m('[tr][td colspan="8"][div class="empty-inline"]没有符合条件的 Episode[/div][/td][/tr]');
     body.querySelectorAll('tr[data-id]').forEach(row=>row.onclick=()=>openEpisode(row.dataset.id));
+    body.querySelectorAll('[data-episode-preview]').forEach(button=>button.onclick=event=>{event.stopPropagation();const action=button.dataset.episodePreview,id=button.dataset.assetId;if(action==='play')openEpisode(button.dataset.episodeId);else requestEpisodePreview(id,true)});
   }
+  function episodePreviewAction(ep){const asset=getAssets().find(item=>item.id===ep.assetId),state=episodePreviewStates.get(ep.assetId),status=state?.status||ep.previewStatus;if(ep.externalVideo)return m(`[button class="btn episode-preview-button" data-episode-preview="play" data-episode-id="${escapeHtml(ep.id)}"][i data-lucide="play"][/i]播放[/button]`);if(!ep.generatedPreview)return '--';if(status==='ready')return m(`[button class="btn episode-preview-button" data-episode-preview="play" data-episode-id="${escapeHtml(ep.id)}"][i data-lucide="play"][/i]播放[/button]`);if(['queued','running'].includes(status)){const pct=state?.total?Math.round(Number(state.completed||0)/Number(state.total)*100):0;return m(`[span class="status medium"]${status==='queued'?'排队':'生成中'} ${pct}%[/span]`)}if(status==='failed')return m(`[button class="btn episode-preview-button" data-episode-preview="generate" data-asset-id="${escapeHtml(ep.assetId)}"][i data-lucide="refresh-cw"][/i]重试[/button]`);return m(`[button class="btn episode-preview-button" data-episode-preview="generate" data-asset-id="${escapeHtml(ep.assetId)}"][i data-lucide="images"][/i]生成[/button]`)}
   function bindEpisodes(){
     renderEpisodeRows();
     ['episodeSearch','episodeType','episodeStatus'].forEach(id=>document.getElementById(id).addEventListener(id==='episodeSearch'?'input':'change',renderEpisodeRows));
     document.getElementById('runQcBtn').onclick=runQualityChecks;
-    document.getElementById('episodeExport').onclick=()=>downloadCsv('episode-filter.csv',getEpisodes().map(ep=>({Episode:ep.id,类型:ep.type,场景:ep.scene,任务:ep.task,质量分:ep.score,状态:ep.status})));
+    document.getElementById('generateAllPreviews').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{for(const asset of getAssets().filter(asset=>isSequenceAsset(asset)||isUmiSessionAsset(asset))){if(episodePreviewStates.get(asset.id)?.status!=='ready')await requestEpisodePreview(asset.id,false)}showToast('尚未生成的 Episode 已加入预览队列')}finally{button.disabled=false}};
+    document.getElementById('episodeExport').onclick=()=>downloadCsv('episode-filter.csv',getEpisodes().map(ep=>({Episode:ep.id,类型:ep.type,场景:ep.scene,任务:ep.task,时长:ep.duration,帧数:ep.frames,预览:ep.previewStatus,质量分:ep.score,状态:ep.status})));
+    refreshEpisodePreviewStates(true);
   }
   function evalAsset(){throw new Error('本地模拟质检已停用，请使用服务端证据型质检')}
   function qcTargets(scope,model,targetIds){
@@ -493,14 +656,52 @@
     button.disabled=true;button.textContent='正在执行质检…';
     try{const batch=await createQcBatch('待质检数据','标准质检','全部模型');if(!batch){showToast('当前没有待质检数据');return}renderEpisodeRows();showToast(`证据型质检完成：通过 ${batch.passRate}%，发现 ${batch.issueCount} 个问题`)}catch(error){showToast(error.message)}finally{button.disabled=false;button.innerHTML=m('[i data-lucide="play-circle"][/i]运行批量质检');lucide.createIcons()}
   }
+  function episodePreviewMarkup(ep,asset,externalVideos){
+    const state=episodePreviewStates.get(ep.assetId),preview=state?.preview||ep.preview,generatedPreview=isSequenceAsset(asset)||isUmiSessionAsset(asset),previewLabel=isUmiSessionAsset(asset)?'H.264 单机位':'四路同步 H.264';
+    if(!generatedPreview){
+      const video=externalVideos[0];return video?m(`[div][select class="filter-select" id="episodeVideoSelect" aria-label="视频机位" style="margin:8px"]${externalVideos.map(item=>`[option value="${escapeHtml(item.id)}"]${escapeHtml(item.relativePath||item.name)}[/option]`).join('')}[/select][video id="episodeVideo" class="episode-video" controls preload="metadata" playsinline src="${escapeHtml(video.url||`/api/assets/${encodeURIComponent(video.id)}/media`)}"][/video][/div]`):m('[div class="episode-media-empty"][i data-lucide="video-off"][/i][b]未找到同编号视频[/b][small]请检查 video 文件夹与 Episode 编号[/small][/div]');
+    }
+    if(state?.status==='ready'&&preview?.cameras?.length){
+      const videos=preview.cameras.map((camera,index)=>`[video data-preview-video="${escapeHtml(camera.id)}" data-preview-index="${index}" muted playsinline preload="metadata" src="/api/episodes/${encodeURIComponent(ep.assetId)}/preview/${escapeHtml(camera.file)}"][/video]`).join('');
+      const cameraButtons=['all',...preview.cameras.map(camera=>camera.id)].map(key=>`[button data-preview-camera="${escapeHtml(key)}" class="${key==='all'?'active':''}" type="button"]${key==='all'?'四宫格':escapeHtml(key.replace('camera_','机位 '))}[/button]`).join('');
+      const thumbs=['first','middle','last'].map((name,index)=>`[button data-preview-thumb="${index}" type="button" title="跳转到${index===0?'开头':index===1?'中间':'结尾'}"][img src="/api/episodes/${encodeURIComponent(ep.assetId)}/preview/${name}.jpg" alt="${name}" /][span]${index===0?'开头':index===1?'中间':'结尾'}[/span][/button]`).join('');
+      return m(`[div class="episode-preview-shell"][div class="episode-preview-grid" id="episodePreviewGrid"]${videos}[/div][div class="episode-preview-controls"][button class="btn" id="episodePreviewToggle" type="button" title="播放或暂停"][i data-lucide="play"][/i][/button][input id="episodePreviewSeek" type="range" min="0" max="${Number(preview.durationSeconds||0)}" step="0.05" value="0" /][span class="episode-preview-clock" id="episodePreviewClock">0:00 / ${formatDurationSeconds(preview.durationSeconds)}[/span][/div][div class="episode-preview-cameras" id="episodePreviewCameras">${cameraButtons}[/div][div class="episode-preview-thumbs">${thumbs}[/div][/div]`);
+    }
+    if(['queued','running'].includes(state?.status)){
+      const pct=state.total?Math.round(Number(state.completed||0)/Number(state.total)*100):0;
+      return m(`[div class="episode-preview-empty"][i data-lucide="loader-circle"][/i][b]正在生成${previewLabel} 预览</b][small]${escapeHtml(state.message||'等待任务执行')} · ${pct}%</small><div class="mini-progress" style="width:220px"><i style="width:${pct}%"></i></div>[/div]`);
+    }
+    const failed=state?.status==='failed';
+    return m(`[div class="episode-preview-empty"][i data-lucide="${failed?'circle-alert':'images'}"] [/i][b]${failed?'预览生成失败':'尚未生成 Episode 预览'}</b][small]${escapeHtml(failed?state.message:`按需生成${previewLabel} 预览，不影响原始源文件。`)}</small>[button class="btn primary" id="episodePreviewGenerate" type="button"][i data-lucide="${failed?'refresh-cw':'play'}"][/i]${failed?'重新生成':'生成预览'}[/button][/div]`);
+  }
+  function bindEpisodePreviewControls(dialog,ep){
+    const state=episodePreviewStates.get(ep.assetId),preview=state?.preview;
+    if(state?.status!=='ready'||!preview?.cameras?.length)return;
+    const videos=[...dialog.querySelectorAll('[data-preview-video]')],master=videos[0],grid=dialog.querySelector('#episodePreviewGrid'),toggle=dialog.querySelector('#episodePreviewToggle'),seek=dialog.querySelector('#episodePreviewSeek'),clock=dialog.querySelector('#episodePreviewClock');
+    if(!master||!grid||!toggle||!seek||!clock)return;
+    const duration=Number(preview.durationSeconds||master.duration||0),timeText=value=>`${formatDurationSeconds(value)} / ${formatDurationSeconds(duration)}`;
+    const playAll=async()=>{try{await Promise.all(videos.map(video=>video.play()))}catch(error){showToast(`视频播放失败：${error.message}`)}};
+    const pauseAll=()=>videos.forEach(video=>video.pause());
+    toggle.onclick=()=>{if(master.paused)playAll();else pauseAll()};
+    videos.forEach(video=>{video.onplay=()=>{videos.filter(item=>item!==video).forEach(item=>{if(item.paused)item.play().catch(()=>{})});toggle.innerHTML=m('[i data-lucide="pause"][/i]');lucide.createIcons()};video.onpause=()=>{if(videos.every(item=>item.paused)){toggle.innerHTML=m('[i data-lucide="play"][/i]');lucide.createIcons()}}});
+    master.ontimeupdate=()=>{const time=Number(master.currentTime||0);seek.value=String(Math.min(time,duration));clock.textContent=timeText(time)};
+    seek.oninput=()=>{const time=Number(seek.value||0);videos.forEach(video=>{video.currentTime=time});clock.textContent=timeText(time)};
+    videos.forEach(video=>video.onclick=()=>{const key=video.dataset.previewVideo;dialog.querySelector(`[data-preview-camera="${key}"]`)?.click()});
+    dialog.querySelectorAll('[data-preview-camera]').forEach(button=>button.onclick=()=>{const key=button.dataset.previewCamera;dialog.querySelectorAll('[data-preview-camera]').forEach(item=>item.classList.toggle('active',item===button));grid.classList.toggle('single-camera',key!=='all');videos.forEach(video=>{const active=key==='all'||video.dataset.previewVideo===key;video.classList.toggle('active',active);if(active)video.play().catch(()=>{});else video.pause()})});
+    dialog.querySelectorAll('[data-preview-thumb]').forEach(button=>button.onclick=()=>{const ratio=[0,.5,1][Number(button.dataset.previewThumb)]||0;videos.forEach(video=>{video.currentTime=duration*ratio});seek.value=String(duration*ratio);clock.textContent=timeText(duration*ratio)});
+    if(window.matchMedia?.('(max-width: 760px)').matches)dialog.querySelector('[data-preview-camera="camera_0"]')?.click();
+  }
   function openEpisode(id){
     const ep=getEpisodes().find(item=>item.id===id);if(!ep)return;
-    const assets=getAssets(),trajectory=assets.find(item=>item.id===ep.assetId),videos=assets.filter(item=>item.bundleId===ep.bundleId&&item.bundleRole==='media'&&new RegExp(`episode_0*${ep.episodeIndex}(?:\\D|$)`,'i').test(item.relativePath||item.name)&&item.serverFile),video=videos[0];
-    const annotations=extRead('embodiedAnnotations',[]),annotation=annotations.find(item=>item.assetId===ep.assetId),issues=extRead('embodiedIssues',[]).filter(item=>item.assetId===ep.assetId&&item.status!=='已关闭');
-    const media=video?`[div][select class="filter-select" id="episodeVideoSelect" aria-label="视频机位" style="margin:8px"]${videos.map(item=>`[option value="${escapeHtml(item.id)}"]${escapeHtml(item.relativePath||item.name)}[/option]`).join('')}[/select][video id="episodeVideo" class="episode-video" controls preload="metadata" playsinline src="/api/assets/${encodeURIComponent(video.id)}/media"][/video][/div]`:`[div class="episode-media-empty"][i data-lucide="video-off"][/i][b]未找到同编号视频[/b][small]请检查 video 文件夹与 Episode 编号[/small][/div]`;
-    const dialog=document.getElementById('episodeDialog');dialog.innerHTML=m(`[div class="search-box" style="width:min(920px,calc(100vw - 30px))"][div class="popover-head"][span]${escapeHtml(ep.id)}[/span][button class="close" data-close-dialog][i data-lucide="x"][/i][/button][/div][div style="padding:17px;max-height:76vh;overflow:auto"][div class="viewer" style="min-height:280px"]${media}[/div][div class="detail-grid" style="margin-top:16px"][div class="detail-card"][span]轨迹文件[/span][b]${escapeHtml(trajectory?.relativePath||'--')}[/b][/div][div class="detail-card"][span]视频文件[/span][b]${escapeHtml(video?.relativePath||'缺失')}[/b][/div][div class="detail-card"][span]质检状态[/span][b]${escapeHtml(ep.status)}[/b][/div][div class="detail-card"][span]标注状态[/span][b]${escapeHtml(annotation?.status||'未生成')}[/b][/div][div class="detail-card"][span]未关闭问题[/span][b]${issues.length}[/b][/div][/div][/div][div class="modal-foot"][button class="btn" data-episode-export]导出明细[/button][button class="btn primary" data-episode-annotation]前往标注[/button][/div][/div]`);dialog.classList.add('show');lucide.createIcons();
-    dialog.querySelector('[data-close-dialog]').onclick=()=>dialog.classList.remove('show');dialog.querySelector('[data-episode-export]').onclick=()=>downloadJson(`${ep.id.replace(/[^a-z0-9_-]/gi,'_')}.json`,{episode:ep,trajectory:trajectory?.relativePath||null,videos:videos.map(item=>item.relativePath||item.name),annotation:annotation||null,openIssues:issues});dialog.querySelector('[data-episode-annotation]').onclick=()=>{dialog.classList.remove('show');activeAnnotationId=annotation?.id||'';navigate('annotation',document.querySelector('.nav button[data-page="annotation"]'))};
-    const videoSelect=dialog.querySelector('#episodeVideoSelect');if(videoSelect)videoSelect.onchange=()=>{const player=dialog.querySelector('#episodeVideo');player.src=`/api/assets/${encodeURIComponent(videoSelect.value)}/media`;player.load();dialog.querySelector('.detail-card:nth-child(2) b').textContent=videos.find(item=>item.id===videoSelect.value)?.relativePath||'--'};
+    const assets=getAssets(),trajectory=assets.find(item=>item.id===ep.assetId),videos=episodeVideoSources(trajectory,ep.episodeIndex,assets),video=videos[0],previewState=episodePreviewStates.get(ep.assetId);
+    if((isSequenceAsset(trajectory)||isUmiSessionAsset(trajectory))&&!previewState){refreshEpisodePreviewStates(false).then(()=>{if(episodePreviewStates.has(ep.assetId))openEpisode(id)});return}
+    const annotations=extRead('embodiedAnnotations',[]),annotation=annotations.find(item=>item.assetId===ep.assetId),issues=extRead('embodiedIssues',[]).filter(item=>item.assetId===ep.assetId&&item.status!=='已关闭'),media=episodePreviewMarkup(ep,trajectory,videos);
+    const dialog=document.getElementById('episodeDialog');dialog.innerHTML=m(`[div class="search-box" style="width:min(1120px,calc(100vw - 30px))"][div class="popover-head"][span]${escapeHtml(ep.id)} · ${escapeHtml(ep.duration)}[/span][button class="close" data-close-dialog][i data-lucide="x"][/i][/button][/div][div style="padding:17px;max-height:82vh;overflow:auto"]${media}[div class="detail-grid" style="margin-top:16px"][div class="detail-card"][span]轨迹 / 源目录[/span][b]${escapeHtml(trajectory?.relativePath||trajectory?.sourceDirectory||'--')}[/b][/div][div class="detail-card"][span]预览来源[/span][b]${trajectory?.serverFile?.mode==='external-hdf5-sequence'?'HDF5 四路 RGB':trajectory?.serverFile?.mode==='external-umi-session'?'UMI RGB 原始视频':'原始视频文件'}[/b][/div][div class="detail-card"][span]帧数 / 时长[/span][b]${escapeHtml(ep.frames)} · ${escapeHtml(ep.duration)}[/b][/div][div class="detail-card"][span]质检状态[/span][b]${escapeHtml(ep.status)}</b>[/div][div class="detail-card"][span]标注状态[/span][b]${escapeHtml(annotation?.status||'未生成')}[/b][/div][div class="detail-card"][span]未关闭问题[/span][b]${issues.length}[/b][/div][/div][/div][div class="modal-foot"][button class="btn" data-episode-export]导出明细[/button]${isSequenceAsset(trajectory)&&previewState?.status==='ready'?'[button class="btn" id="episodePreviewCleanup"]清理预览缓存[/button]':''}[button class="btn primary" data-episode-annotation]前往标注[/button][/div][/div]`);dialog.classList.add('show');lucide.createIcons();
+    dialog.querySelector('[data-close-dialog]').onclick=()=>dialog.classList.remove('show');dialog.querySelector('[data-episode-export]').onclick=()=>downloadJson(`${ep.id.replace(/[^a-z0-9_-]/gi,'_')}.json`,{episode:ep,trajectory:trajectory?.relativePath||null,preview:previewState?.preview||null,videos:videos.map(item=>item.relativePath||item.name),annotation:annotation||null,openIssues:issues});dialog.querySelector('[data-episode-annotation]').onclick=()=>{dialog.classList.remove('show');activeAnnotationId=annotation?.id||'';navigate('annotation',document.querySelector('.nav button[data-page="annotation"]'))};
+    dialog.querySelector('#episodePreviewGenerate')?.addEventListener('click',()=>{const button=dialog.querySelector('#episodePreviewGenerate');button.disabled=true;requestEpisodePreview(ep.assetId,true)});
+    dialog.querySelector('#episodePreviewCleanup')?.addEventListener('click',async event=>{event.currentTarget.disabled=true;try{const response=await rawFetch(`/api/episodes/${encodeURIComponent(ep.assetId)}/preview`,{method:'DELETE'}),data=await response.json();if(!response.ok)throw new Error(data.error||'清理预览失败');episodePreviewStates.delete(ep.assetId);dialog.classList.remove('show');renderEpisodeRows();showToast('预览缓存已清理')}catch(error){showToast(error.message);event.currentTarget.disabled=false}});
+    bindEpisodePreviewControls(dialog,ep);
+    const videoSelect=dialog.querySelector('#episodeVideoSelect');if(videoSelect)videoSelect.onchange=()=>{const player=dialog.querySelector('#episodeVideo'),selected=videos.find(item=>item.id===videoSelect.value);player.src=selected?.url||`/api/assets/${encodeURIComponent(videoSelect.value)}/media`;player.load();dialog.querySelector('.detail-card:nth-child(2) b').textContent=selected?.relativePath||'--'};
   }
   function annotationMissingFields(item){
     const missing=[];
@@ -515,19 +716,19 @@
   function annotationGroupsLocal(){
     const remote=extRead('embodiedAnnotationGroups',[]);if(Array.isArray(remote)&&remote.length)return remote;
     const standards=extRead('embodiedAnnotationStandards',{}),annotations=extRead('embodiedAnnotations',[]),map=new Map();
-    getAssets().filter(asset=>asset.bundleRole==='trajectory'&&/episode_\d+\.parquet$/i.test(asset.relativePath||asset.name)).forEach(asset=>{const key=annotationGroupKeyOf({assetId:asset.id,bundleId:asset.bundleId,groupKey:asset.taskId?`TASK:${asset.taskId}`:''});if(!key)return;const scopeType=key.startsWith('TASK:')?'task':'bundle';if(!map.has(key))map.set(key,{key,scopeType,scopeId:key.replace(/^TASK:/,''),name:scopeType==='task'?(asset.taskName||key.replace(/^TASK:/,'')):(asset.bundleName||asset.bundleId),episodeCount:0,annotationCount:0});map.get(key).episodeCount++});
+    getAssets().filter(isLogicalEpisodeAsset).forEach(asset=>{const key=annotationGroupKeyOf({assetId:asset.id,bundleId:asset.bundleId,groupKey:asset.taskId?`TASK:${asset.taskId}`:''});if(!key)return;const scopeType=key.startsWith('TASK:')?'task':'bundle';if(!map.has(key))map.set(key,{key,scopeType,scopeId:key.replace(/^TASK:/,''),name:scopeType==='task'?(asset.taskName||key.replace(/^TASK:/,'')):(asset.bundleName||asset.bundleId),episodeCount:0,annotationCount:0});map.get(key).episodeCount++});
     map.forEach((group,key)=>{const standard=standards[key]||{},items=annotations.filter(item=>annotationGroupKeyOf(item)===key);group.annotationCount=items.length;group.stats=annotationGroupStatsLocal(key);group.status=standard.status||(items.some(item=>item.status==='待审核')?'待审核':items.some(item=>item.status==='已驳回')?'已驳回':items.some(item=>item.status==='标注中'||String(item.instruction||'').trim())?'标注中':'待标注');group.instruction=standard.instruction||'';group.note=standard.note||'';group.updatedBy=standard.updatedBy||'';group.reviewer=standard.reviewer||'';group.reviewedAt=standard.reviewedAt||''});
     return [...map.values()];
   }
   function annotationGroupStatsLocal(key){
-    const assets=getAssets(),groupAssets=assets.filter(asset=>annotationGroupKeyOf({assetId:asset.id,bundleId:asset.bundleId,groupKey:asset.taskId?`TASK:${asset.taskId}`:''})===key),episodes=groupAssets.filter(asset=>asset.bundleRole==='trajectory'&&/episode_\d+\.parquet$/i.test(asset.relativePath||asset.name)),openIds=new Set(extRead('embodiedIssues',[]).filter(issue=>issue.status!=='已关闭').map(issue=>issue.assetId)),openIssueCount=groupAssets.filter(asset=>openIds.has(asset.id)).length;let videoCovered=0,missingVideoCount=0,qcPendingCount=0;episodes.forEach(asset=>{const match=/episode_(\d+)\.parquet$/i.exec(asset.relativePath||asset.name),episodeIndex=match?Number(match[1]):null,hasVideo=groupAssets.some(item=>item.bundleId===asset.bundleId&&item.bundleRole==='media'&&item.serverFile&&(new RegExp(`episode_0*${episodeIndex}(?:\\D|$)`,'i').test(item.relativePath||item.name)));if(hasVideo)videoCovered++;else missingVideoCount++;if(!asset.lastQcAt||asset.status!=='已通过')qcPendingCount++});return{episodeCount:episodes.length,videoCovered,missingVideoCount,qcPendingCount,openIssueCount,anomalyCount:missingVideoCount+qcPendingCount+openIssueCount}}
+    const assets=getAssets(),groupAssets=assets.filter(asset=>annotationGroupKeyOf({assetId:asset.id,bundleId:asset.bundleId,groupKey:asset.taskId?`TASK:${asset.taskId}`:''})===key),episodes=groupAssets.filter(isLogicalEpisodeAsset),openIds=new Set(extRead('embodiedIssues',[]).filter(issue=>issue.status!=='已关闭').map(issue=>issue.assetId)),openIssueCount=groupAssets.filter(asset=>openIds.has(asset.id)).length;let videoCovered=0,missingVideoCount=0,qcPendingCount=0;episodes.forEach(asset=>{const episodeIndex=episodeIndexForAsset(asset),embedded=isSequenceAsset(asset)||isUmiSessionAsset(asset),hasVideo=embedded||groupAssets.some(item=>item.bundleId===asset.bundleId&&item.bundleRole==='media'&&item.serverFile&&(new RegExp(`episode_0*${episodeIndex}(?:\\D|$)`,'i').test(item.relativePath||item.name)));if(hasVideo)videoCovered++;else missingVideoCount++;if(!asset.lastQcAt||asset.status!=='已通过')qcPendingCount++});return{episodeCount:episodes.length,videoCovered,missingVideoCount,qcPendingCount,openIssueCount,anomalyCount:missingVideoCount+qcPendingCount+openIssueCount}}
   function annotationGroupFlowLocal(group){
     const assets=getAssets().filter(asset=>annotationGroupKeyOf({assetId:asset.id,bundleId:asset.bundleId,groupKey:asset.taskId?`TASK:${asset.taskId}`:''})===group.key),trajectories=assets.filter(asset=>asset.bundleRole==='trajectory'),sourceAssets=trajectories.length?trajectories:assets.filter(asset=>asset.bundleRole!=='media'),source=[...new Set(sourceAssets.map(asset=>String(asset.format||'').trim().toUpperCase()).filter(Boolean))],bundleIds=new Set(assets.map(asset=>asset.bundleId)),exports=extRead('embodiedExports',[]).filter(job=>bundleIds.has(job.batchId)||(job.batchIds||[]).some(id=>bundleIds.has(id))),delivery=[...new Set(exports.flatMap(job=>{const converted=Object.entries(job.conversions||{}).filter(([,output])=>output?.ok).map(([format])=>format.toUpperCase());return converted.length?converted:[String(job.format||'').toUpperCase()]}).filter(Boolean))];return{source:source.join(' + ')||'原始数据',delivery:delivery.join(' + ')||'未生成',sourceFormats:source,deliveryFormats:delivery}
   }
   function annotationLatestExceptionReview(assetId){return extRead('embodiedExceptionReviews',[]).find(item=>item.assetId===assetId)||null}
   function annotationEpisodeExceptionReasons(episode,group){
     const asset=getAssets().find(item=>item.id===episode.assetId),videos=getAssets().filter(item=>item.bundleId===episode.bundleId&&item.bundleRole==='media'&&item.serverFile&&new RegExp(`episode_0*${episode.episodeIndex}(?:\\D|$)`,'i').test(item.relativePath||item.name)),issues=extRead('embodiedIssues',[]).filter(issue=>issue.assetId===episode.assetId&&issue.status!=='已关闭'),reasons=[];
-    if(!videos.length)reasons.push('缺视频');
+    if(!isUmiSessionAsset(asset)&&!videos.length)reasons.push('缺视频');
     if(issues.length)reasons.push(`未关闭问题 ${issues.length}`);
     if(!asset?.lastQcAt)reasons.push('待质检');else if(asset.status!=='已通过')reasons.push('质检未通过');
     if(group?.status==='已驳回')reasons.push('标准已驳回');
@@ -544,12 +745,13 @@
     if(!selected)return `${kpis}<section class="panel"><div class="panel-head"><div><div class="panel-title">任务指令标注</div><div class="panel-sub">同一采集任务或数据集只需填写并审核一次</div></div>${generate}</div><div class="empty-inline" style="padding:48px">${allGroups.length?'当前筛选条件下没有任务指令。':'暂无可标注任务。完成 Episode 质检后点击“同步 Episode”。'}</div></section>`;
     const editable=['待标注','标注中','已驳回'].includes(selected.status)&&can('标注编辑','资产管理'),reviewable=selected.status==='待审核'&&can('标注审核','资产管理'),reopenable=['已通过','已驳回'].includes(selected.status)&&can('标注编辑','资产管理'),readonly=editable?'':' readonly';
     const episodes=getEpisodes().filter(episode=>{const asset=getAssets().find(item=>item.id===episode.assetId);return annotationGroupKeyOf({assetId:episode.assetId,bundleId:episode.bundleId,groupKey:asset?.taskId?`TASK:${asset.taskId}`:''})===selected.key});
-    const episodeRows=episodes.slice(0,12).map(episode=>`<tr><td>${escapeHtml(episode.id)}</td><td>${escapeHtml(episode.task)}</td><td>${typeBadge(episode.type)}</td><td>${statusBadge(episode.status)}</td><td><button class="btn" data-open-annotation-episode="${escapeHtml(episode.id)}">查看</button></td></tr>`).join('');
+    const localAnnotations=extRead('embodiedAnnotations',[]);
+    const episodeRows=episodes.slice(0,12).map(episode=>{const annotation=localAnnotations.find(item=>item.assetId===episode.assetId),instruction=annotation?.instruction||selected.instruction||'';return `<tr><td>${escapeHtml(episode.id)}</td><td>${escapeHtml(instruction||'--')}</td><td>${escapeHtml(episode.task)}</td><td>${typeBadge(episode.type)}</td><td>${statusBadge(episode.status)}</td><td><button class="btn" data-open-annotation-episode="${escapeHtml(episode.id)}">查看</button></td></tr>`}).join('');
     const actionButtons=editable?`<button class="btn" id="saveTaskAnnotation">保存指令</button><button class="btn primary" id="submitTaskAnnotation">提交审核</button>`:reviewable?`<button class="btn danger" id="rejectTaskAnnotation">退回修改</button><button class="btn success" id="approveTaskAnnotation">审核通过</button>`:reopenable?`<button class="btn" id="reopenTaskAnnotation">重新打开</button>`:'';
-    const statusHint=reviewable?'指令为只读审核视图：确认任务描述后通过或退回。':reopenable?'该任务指令已通过审核。如需修改，请先重新打开。':editable?'该指令会应用到当前范围的全部 Episode，只需提交一次审核。':'当前账号只能查看该任务指令。';
-    return `${kpis}<div class="review-layout"><section class="panel"><div class="panel-head"><div><div class="panel-title">${escapeHtml(selected.name)}</div><div class="panel-sub">${selected.scopeType==='task'?'采集任务':'数据集'} · ${selected.episodeCount} 个 Episode · 指令只需标注一次</div></div>${statusBadge(selected.status)}</div><div class="annotation-status-strip"><div class="annotation-progress"><div style="width:${selected.status==='已通过'?100:selected.status==='待审核'?90:selected.instruction?40:0}%"></div></div><span>${selected.instruction?'指令已填写':'尚未填写指令'}</span><small>${escapeHtml(statusHint)}</small></div><div class="ext-form"><label for="annotationTaskInstruction">任务指令（当前范围全部 Episode 共用）</label><textarea id="annotationTaskInstruction" placeholder="描述该任务的标准操作目标"${readonly}>${escapeHtml(selected.instruction||'')}</textarea><p>平台内部会将该指令展开到 ${selected.episodeCount} 个 Episode，但不再要求逐 Episode 填写结果或动作分段。</p><label for="taskAnnotationNote">审核意见</label><textarea id="taskAnnotationNote" placeholder="退回时必填，通过时可填写复核结论"${reviewable||reopenable?'':' readonly'}>${escapeHtml(selected.note||'')}</textarea><div class="annotation-record-meta"><span>范围编号：${escapeHtml(selected.scopeId)}</span><span>更新人：${escapeHtml(selected.updatedBy||'--')}</span><span>审核人：${escapeHtml(selected.reviewer||'--')}</span><span>审核时间：${escapeHtml(selected.reviewedAt?new Date(selected.reviewedAt).toLocaleString('zh-CN',{hour12:false}):'--')}</span></div><div class="modal-foot" style="padding:13px 0 0">${actionButtons}</div></div></section><section class="panel"><div class="panel-head"><div><div class="panel-title">继承的 Episode</div><div class="panel-sub">显示 ${Math.min(episodes.length,12)} / ${episodes.length} 个 Episode，仅用于查看，不重复标注</div></div>${generate}</div><div class="annotation-toolbar"><select class="filter-select" id="annotationScopeFilter" aria-label="标注范围筛选"><option value="all"${annotationScopeFilter==='all'?' selected':''}>全部范围</option><option value="task"${annotationScopeFilter==='task'?' selected':''}>按采集任务</option><option value="bundle"${annotationScopeFilter==='bundle'?' selected':''}>按数据集</option></select><select class="filter-select" id="annotationQueueStatus" aria-label="指令状态筛选"><option value="all"${annotationQueueStatus==='all'?' selected':''}>全部状态（${scopedGroups.length}）</option>${['待标注','标注中','待审核','已通过','已驳回'].map(status=>`<option value="${status}"${annotationQueueStatus===status?' selected':''}>${status}（${scopedGroups.filter(item=>item.status===status).length}）</option>`).join('')}</select></div><div class="table-scroll"><table class="module-table"><thead><tr><th>Episode</th><th>来源</th><th>类型</th><th>质检</th><th>操作</th></tr></thead><tbody>${episodeRows||'<tr><td colspan="5"><div class="empty-inline">该范围暂无可查看 Episode</div></td></tr>'}</tbody></table></div><div class="annotation-list">${queue.map(item=>annotationCard(item,selected.key)).join('')}</div></section></div>`;
+    const statusHint=selected.autoImported?'系统已解析源 JSONL 并自动匹配全部 Episode，无需人工填写。如需覆盖，请先重新打开。':reviewable?'指令为只读审核视图：确认任务描述后通过或退回。':reopenable?'该任务指令已通过审核。如需修改，请先重新打开。':editable?'该指令会应用到当前范围的全部 Episode，只需提交一次审核。':'当前账号只能查看该任务指令。';
+    return `${kpis}<div class="review-layout"><section class="panel"><div class="panel-head"><div><div class="panel-title">${escapeHtml(selected.name)}</div><div class="panel-sub">${selected.scopeType==='task'?'采集任务':'数据集'} · ${selected.episodeCount} 个 Episode · ${selected.autoImported?'源文件自动导入，按 Episode 保留指令':'指令只需标注一次'}</div></div>${statusBadge(selected.status)}</div><div class="annotation-status-strip"><div class="annotation-progress"><div style="width:${selected.status==='已通过'?100:selected.status==='待审核'?90:selected.instruction?40:0}%"></div></div><span>${selected.autoImported?'源文件自动通过':selected.instruction?'指令已填写':'尚未填写指令'}</span><small>${escapeHtml(statusHint)}</small></div><div class="ext-form"><label for="annotationTaskInstruction">${selected.autoImported?'源文件标注指令摘要':'任务指令（当前范围全部 Episode 共用）'}</label><textarea id="annotationTaskInstruction" placeholder="描述该任务的标准操作目标"${readonly}>${escapeHtml(selected.instruction||'')}</textarea><p>${selected.autoImported?`系统已从源 JSONL 自动解析 ${selected.episodeCount} 个 Episode，共 ${selected.instructionCount||1} 条不同指令；交付会按 Episode 使用各自内容。`:`平台内部会将该指令展开到 ${selected.episodeCount} 个 Episode，但不再要求逐 Episode 填写结果或动作分段。`}</p><label for="taskAnnotationNote">审核意见</label><textarea id="taskAnnotationNote" placeholder="退回时必填，通过时可填写复核结论"${reviewable||reopenable?'':' readonly'}>${escapeHtml(selected.note||'')}</textarea><div class="annotation-record-meta"><span>范围编号：${escapeHtml(selected.scopeId)}</span><span>更新人：${escapeHtml(selected.updatedBy||'--')}</span><span>审核人：${escapeHtml(selected.reviewer||'--')}</span><span>审核时间：${escapeHtml(selected.reviewedAt?new Date(selected.reviewedAt).toLocaleString('zh-CN',{hour12:false}):'--')}</span></div><div class="modal-foot" style="padding:13px 0 0">${actionButtons}</div></div></section><section class="panel"><div class="panel-head"><div><div class="panel-title">继承的 Episode</div><div class="panel-sub">显示 ${Math.min(episodes.length,12)} / ${episodes.length} 个 Episode，仅用于查看，不重复标注</div></div>${generate}</div><div class="annotation-toolbar"><select class="filter-select" id="annotationScopeFilter" aria-label="标注范围筛选"><option value="all"${annotationScopeFilter==='all'?' selected':''}>全部范围</option><option value="task"${annotationScopeFilter==='task'?' selected':''}>按采集任务</option><option value="bundle"${annotationScopeFilter==='bundle'?' selected':''}>按数据集</option></select><select class="filter-select" id="annotationQueueStatus" aria-label="指令状态筛选"><option value="all"${annotationQueueStatus==='all'?' selected':''}>全部状态（${scopedGroups.length}）</option>${['待标注','标注中','待审核','已通过','已驳回'].map(status=>`<option value="${status}"${annotationQueueStatus===status?' selected':''}>${status}（${scopedGroups.filter(item=>item.status===status).length}）</option>`).join('')}</select></div><div class="table-scroll"><table class="module-table"><thead><tr><th>Episode</th><th>指令</th><th>来源</th><th>类型</th><th>质检</th><th>操作</th></tr></thead><tbody>${episodeRows||'<tr><td colspan="6"><div class="empty-inline">该范围暂无可查看 Episode</div></td></tr>'}</tbody></table></div><div class="annotation-list">${queue.map(item=>annotationCard(item,selected.key)).join('')}</div></section></div>`;
   }
-  function legacyTaskAnnotationCard(item,selectedKey){return `<div class="annotation-card ${item.key===selectedKey?'active':''}" data-annotation-group-key="${escapeHtml(item.key)}"><div><b>${escapeHtml(item.name)}</b><p>${item.scopeType==='task'?'采集任务':'数据集'} · ${item.episodeCount} 个 Episode · ${item.instruction?'指令已填写':'待填写指令'}</p></div>${statusBadge(item.status)}</div>`}
+  function legacyTaskAnnotationCard(item,selectedKey){return `<div class="annotation-card ${item.key===selectedKey?'active':''}" data-annotation-group-key="${escapeHtml(item.key)}"><div><b>${escapeHtml(item.name)}</b><p>${item.scopeType==='task'?'采集任务':'数据集'} · ${item.episodeCount} 个 Episode · ${item.autoImported?'源文件自动解析完成':item.instruction?'指令已填写':'待填写指令'}</p></div>${statusBadge(item.status)}</div>`}
   function annotationIsEditableStatus(item){return ['待标注','标注中','已驳回'].includes(item?.status)}
   function annotationIsAnomaly(item){const stats=item?.stats||{};return item?.status==='已驳回'||Number(stats.missingVideoCount||0)>0||Number(stats.openIssueCount||0)>0||Number(stats.qcPendingCount||0)>0}
   function annotationStepbar(selected){
@@ -708,25 +910,26 @@
     const buttons=['saveAnnotation','submitAnnotation','approveAnnotation','rejectAnnotation','reopenAnnotation'].map(buttonId=>document.getElementById(buttonId)).filter(Boolean);buttons.forEach(button=>button.disabled=true);
     try{const response=await fetch('/api/annotations/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),data=await response.json();if(!response.ok)throw new Error(data.error||'标注保存失败');extWrite('embodiedAnnotations',data.annotations||[]);extWrite('embodiedAnnotationStandards',data.annotationStandards||extRead('embodiedAnnotationStandards',{}));activeAnnotationId=id;moduleTemplates.annotation=annotationTemplate();showPage('annotation');showToast(({save:'标注草稿已保存',submit:'标注已提交审核',approve:'标注审核通过',reject:'标注已退回修改',reopen:'标注已重新打开'})[action]||'标注已更新')}catch(error){buttons.forEach(button=>button.disabled=false);showToast(error.message)}
   }
-  function logicalEpisodeCount(assets){return assets.filter(item=>item.bundleRole==='trajectory'&&/episode_\d+\.parquet$/i.test(item.relativePath||item.name)).length}
+  function logicalEpisodeCount(assets){return assets.filter(isLogicalEpisodeAsset).length}
   function exportJobForBundle(jobs,bundleId){return bundleId?jobs.find(job=>job.batchId===bundleId||(job.batchIds||[]).includes(bundleId)):null}
   function exportsTemplate(){
     const jobs=extRead('embodiedExports',[]),snapshot=qualityHealthSnapshot(),packages=packageHealthRows(snapshot),acceptedRows=packages.filter(item=>item.status==='已验收'&&item.ready);
     if(!activeExportBundleId||!acceptedRows.some(item=>item.id===activeExportBundleId))activeExportBundleId=acceptedRows[0]?.id||'';
     const selected=acceptedRows.find(item=>item.id===activeExportBundleId)||null,issues=snapshot.openIssues,blocked=new Set(issues.filter(item=>item.status!=='已关闭').map(item=>item.assetId)),batchAssets=selected?.files||[],eligible=batchAssets.filter(item=>item.serverFile&&item.status==='已通过'&&!blocked.has(item.id)),episodeCount=logicalEpisodeCount(eligible),existing=exportJobForBundle(jobs,selected?.id),batchOptions=acceptedRows.length?acceptedRows.map(item=>`<option value="${escapeHtml(item.id)}"${item.id===activeExportBundleId?' selected':''}>${escapeHtml(item.name)} · ${item.episodeCount} 条数据 / ${item.files.length} 个文件</option>`).join(''):'<option value="">暂无可交付批次</option>';
-    return `<div class="ext-grid"><section class="panel"><div class="panel-head"><div><div class="panel-title">格式转换与交付</div><div class="panel-sub">V6 · 同一批次可分别生成 LeRobot、MCAP 和 Zarr 产物</div></div></div><div class="ext-form"><label for="exportBatch">生产批次</label><select class="select" id="exportBatch" style="width:100%">${batchOptions}</select><label for="exportName">交付包名称</label><input class="input" style="width:100%" id="exportName" value="Embodied-Quality-Release" /><label for="deliveryFormat">目标格式</label><select class="select" id="deliveryFormat" style="width:100%"><option value="lerobot">LeRobot v2.1</option><option value="mcap">MCAP · JSON 轨迹 + 原视频</option><option value="zarr">Zarr v2 · 列数组 + 原视频</option></select><p id="deliveryFormatNote"></p><p>${selected?`${episodeCountLabel(selected)} · ${existing?"已有基础交付记录，可追加格式":"验收已通过"}`:"请先完成批次验收"}</p><p id="deliveryProgress" role="status" aria-live="polite"></p><div class="modal-foot" style="padding:16px 0 0"><button class="btn primary" id="createExport"${selected?"":" disabled"}>转换并打包</button></div></div></section><section class="panel"><div class="panel-head"><div><div class="panel-title">交付门禁</div><div class="panel-sub">原文件、质检、任务指令和批次验收全部满足后转换</div></div></div><div class="check-list">${gateMarkup("已存原文件",batchAssets.filter(item=>item.serverFile).length,batchAssets.length,"hard-drive")}${gateMarkup("质检通过",batchAssets.filter(item=>item.serverFile&&item.status==="已通过"&&!blocked.has(item.id)).length,batchAssets.length,"shield-check")}${gateMarkup("可交付数据",episodeCount,selected?.episodeCount||0,"package-check")}</div></section></div><section class="panel" style="margin-top:17px"><div class="panel-head"><div><div class="panel-title">多格式交付记录</div><div class="panel-sub">同一批次一份记录，每种格式保留独立产物、校验证据和 SHA-256</div></div><button class="btn" id="exportManifest"><i data-lucide="file-down"></i>导出记录 CSV</button></div><div class="table-scroll"><table class="module-table"><thead><tr><th>编号</th><th>批次 / 名称</th><th>数据条数</th><th>文件数</th><th>创建时间</th><th>格式 / 校验</th><th>下载</th></tr></thead><tbody>${jobs.length?jobs.map(exportRow).join(""):'<tr><td colspan="7"><div class="empty-inline">尚无交付记录</div></td></tr>'}</tbody></table></div></section>`;
+    return `<div class="ext-grid"><section class="panel"><div class="panel-head"><div><div class="panel-title">格式转换与交付</div><div class="panel-sub">V6 · LeRobot v3.0 训练交付，同时保留 MCAP 和 Zarr 交换格式</div></div></div><div class="ext-form"><label for="exportBatch">生产批次</label><select class="select" id="exportBatch" style="width:100%">${batchOptions}</select><label for="exportName">交付包名称</label><input class="input" style="width:100%" id="exportName" value="Embodied-Quality-Release" /><label for="deliveryFormat">目标格式</label><select class="select" id="deliveryFormat" style="width:100%"><option value="lerobot">LeRobot v3.0 · 训练交付</option><option value="mcap">MCAP · JSON 轨迹 + 原视频</option><option value="zarr">Zarr v2 · 列数组 + 原视频</option></select><p id="deliveryFormatNote"></p><p>${selected?`${episodeCountLabel(selected)} · ${existing?"已有基础交付记录，可追加格式":"验收已通过"}`:"请先完成批次验收"}</p><p id="deliveryProgress" role="status" aria-live="polite"></p><div class="modal-foot" style="padding:16px 0 0"><button class="btn primary" id="createExport"${selected?"":" disabled"}>转换并打包</button></div></div></section><section class="panel"><div class="panel-head"><div><div class="panel-title">交付门禁</div><div class="panel-sub">原文件、质检、任务指令和批次验收全部满足后转换</div></div></div><div class="check-list">${gateMarkup("已存原文件",batchAssets.filter(item=>item.serverFile).length,batchAssets.length,"hard-drive")}${gateMarkup("质检通过",batchAssets.filter(item=>item.serverFile&&item.status==="已通过"&&!blocked.has(item.id)).length,batchAssets.length,"shield-check")}${gateMarkup("可交付数据",episodeCount,selected?.episodeCount||0,"package-check")}</div></section></div><section class="panel" style="margin-top:17px"><div class="panel-head"><div><div class="panel-title">多格式交付记录</div><div class="panel-sub">同一批次一份记录，每种格式保留独立产物、校验证据和 SHA-256</div></div><button class="btn" id="exportManifest"><i data-lucide="file-down"></i>导出记录 CSV</button></div><div class="table-scroll"><table class="module-table"><thead><tr><th>编号</th><th>批次 / 名称</th><th>数据条数</th><th>文件数</th><th>创建时间</th><th>格式 / 校验</th><th>下载</th></tr></thead><tbody>${jobs.length?jobs.map(exportRow).join(""):'<tr><td colspan="7"><div class="empty-inline">尚无交付记录</div></td></tr>'}</tbody></table></div></section>`;
   }
   function exportRow(job){
     const outputs=Object.entries(job.conversions||{}).filter(([,output])=>output.ok&&output.current!==false&&output.independentVerification?.ok);
+    const lerobotVerified=job.conversions?.lerobot?.ok&&job.conversions.lerobot.independentVerification?.officialVerification==='passed';
     const downloads=outputs.map(([format,output])=>`<a class="btn" href="/api/exports/${encodeURIComponent(job.id)}/package?format=${encodeURIComponent(format)}" download title="SHA-256: ${escapeHtml(output.archiveSha256||'')}">${escapeHtml(format.toUpperCase())} ZIP</a>`).join(' ');
-    return `<tr><td>${escapeHtml(job.id)}</td><td><b>${escapeHtml(job.batchName||job.name||'--')}</b><br><small>${escapeHtml(job.name||'')}</small></td><td>${Number(job.episodeCount||0)}</td><td>${Number(job.fileCount||job.assetCount||0)}</td><td>${escapeHtml(job.createdAt?new Date(job.createdAt).toLocaleString('zh-CN',{hour12:false}):'--')}</td><td>${escapeHtml(outputs.length?outputs.map(([format])=>format.toUpperCase()).join(' / '):job.format||'LeRobot v2.1')}<br><small>${outputs.length?'已独立回读、完整解码视频；训练端兼容性待验收':'基础目录已生成，需转换并独立校验'}</small></td><td><div class="row-actions" style="flex-wrap:wrap">${downloads}<a class="btn" href="/api/exports/${encodeURIComponent(job.id)}/download" download>Manifest</a>${Number(job.annotationCount||0)?` <a class="btn" href="/api/exports/${encodeURIComponent(job.id)}/annotations" download>标注 JSONL</a>`:''}</div></td></tr>`
+    return `<tr><td>${escapeHtml(job.id)}</td><td><b>${escapeHtml(job.batchName||job.name||'--')}</b><br><small>${escapeHtml(job.name||'')}</small></td><td>${Number(job.episodeCount||0)}</td><td>${Number(job.fileCount||job.assetCount||0)}</td><td>${escapeHtml(job.createdAt?new Date(job.createdAt).toLocaleString('zh-CN',{hour12:false}):'--')}</td><td>${escapeHtml(outputs.length?outputs.map(([format])=>format.toUpperCase()).join(' / '):job.format||'LeRobot v3.0')}<br><small>${lerobotVerified?'官方 LeRobot 0.4.4 加载、帧解码与 DataLoader 冒烟通过':outputs.length?'已独立回读、完整解码视频；非 LeRobot 产物不代表训练框架兼容':'基础交付目录已生成，需转换并独立校验'}</small></td><td><div class="row-actions" style="flex-wrap:wrap">${downloads}<a class="btn" href="/api/exports/${encodeURIComponent(job.id)}/download" download>Manifest</a>${Number(job.annotationCount||0)?` <a class="btn" href="/api/exports/${encodeURIComponent(job.id)}/annotations" download>标注 JSONL</a>`:''}</div></td></tr>`
   }
   function bindExports(){
     const packages=packageHealthRows(qualityHealthSnapshot()),selected=packages.find(item=>item.id===activeExportBundleId&&item.status==='已验收'&&item.ready),existing=exportJobForBundle(extRead('embodiedExports',[]),selected?.id),button=document.getElementById('createExport'),batch=document.getElementById('exportBatch');
     if(batch)batch.onchange=()=>{activeExportBundleId=batch.value;moduleTemplates.exports=exportsTemplate();showPage('exports')};
-    document.getElementById('pageDesc').textContent='按 V6 流程生成 LeRobot、MCAP 或 Zarr 交付包，查看转换证据并下载 ZIP。';
-    const selector=document.getElementById('deliveryFormat'),labels={lerobot:'LeRobot v2.1',mcap:'MCAP',zarr:'Zarr v2'};
-    const update=()=>{const done=(existing?.conversions?.[activeDeliveryFormat]?.ok&&existing.conversions[activeDeliveryFormat].current!==false);button.disabled=!selected;button.textContent=done?'检查并复用已验证产物':`转换并打包 ${labels[activeDeliveryFormat]}`;document.getElementById('deliveryFormatNote').textContent=activeDeliveryFormat==='mcap'?'MCAP 使用 JSON 轨迹消息；原视频随 ZIP 保留，通过相对路径关联。此格式不包含 ROS 消息或解码后图像话题。':activeDeliveryFormat==='zarr'?'按 Episode 保存 Zarr v2 列数组，原视频与审核后的任务指令随 ZIP 保留。':'保留 meta、data、videos，使用当前审核后的任务指令，并验证原始轨迹和视频文件哈希。'};
+    document.getElementById('pageDesc').textContent='按 V6 流程生成 LeRobot v3.0、MCAP 或 Zarr 交付包，查看官方加载与独立校验证据并下载 ZIP。';
+    const selector=document.getElementById('deliveryFormat'),labels={lerobot:'LeRobot v3.0',mcap:'MCAP',zarr:'Zarr v2'};
+    const update=()=>{const done=(existing?.conversions?.[activeDeliveryFormat]?.ok&&existing.conversions[activeDeliveryFormat].current!==false);button.disabled=!selected;button.textContent=done?'检查并复用已验证产物':`转换并打包 ${labels[activeDeliveryFormat]}`;document.getElementById('deliveryFormatNote').textContent=activeDeliveryFormat==='mcap'?'MCAP 使用 JSON 轨迹消息；原视频随 ZIP 保留，通过相对路径关联。此格式不包含 ROS 消息或解码后图像话题。':activeDeliveryFormat==='zarr'?'按 Episode 保存 Zarr v2 列数组，原视频与审核后的任务指令随 ZIP 保留。':'转换为官方 LeRobot v3.0，加载 Dataset、读取首中末视频帧并执行 DataLoader 冒烟；通过后才标记为训练交付可用。'};
     if(selector){selector.value=activeDeliveryFormat;selector.onchange=()=>{activeDeliveryFormat=selector.value;update()};update()}
     document.querySelectorAll('[data-export-content]').forEach(button=>button.onclick=()=>button.classList.toggle('selected'));
     if(button)button.onclick=async()=>{
@@ -736,7 +939,7 @@
       try{
         let job=existing;
         if(!job){progress.textContent='正在建立基础交付目录…';const response=await fetch('/api/exports',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,format:'LeRobot',bundleId:selected.id,assetIds:selected.files.map(asset=>asset.id)})}),data=await response.json();if(!response.ok)throw new Error(data.error);job=data.job;extWrite('embodiedExports',data.exports||[])}
-        progress.textContent=`正在转换 ${labels[format]}，随后回读轨迹、校验视频哈希并打包；大批次可能需要较长时间…`;
+        progress.textContent=`正在转换 ${labels[format]}，随后执行独立回读${format==='lerobot'?'、官方 Dataset 加载和 DataLoader 冒烟':''}并打包；大批次可能需要较长时间…`;
         const response=await fetch('/api/exports/convert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:job.id,format})}),data=await response.json();if(!response.ok)throw new Error(data.error||'格式转换失败');
         extWrite('embodiedExports',data.exports||[]);await syncServerState();moduleTemplates.exports=exportsTemplate();showPage('exports');showToast(`${labels[format]} ${data.duplicate?'已复用验证产物':'转换与验证完成'}，可在下方下载 ZIP`)
       }catch(error){progress.textContent=error.message;showToast(error.message)}finally{button.disabled=false;selector.disabled=false;button.removeAttribute('aria-busy')}
@@ -847,6 +1050,8 @@
         [select class="filter-select" id="assetTypeFilter"][option value="all"]全部类型[/option][option]UMI[/option][option]EGO[/option][option]遥操[/option][/select]
         [select class="filter-select" id="assetStatusFilter"][option value="all"]全部质量状态[/option][option]已通过[/option][option]待深检[/option][option]待补传[/option][option]问题[/option][option]待质检[/option][/select]
         [select class="filter-select" id="assetModelFilter"][option value="all"]全部模型[/option][/select]
+        [select class="filter-select" id="assetBundleFilter"][option value="all"]全部数据包[/option][/select]
+        [select class="filter-select" id="assetFolderFilter"][option value="all"]全部文件夹[/option][/select]
         [span class="spacer"][/span][button class="btn" id="assetExportBtn"][i data-lucide="download"][/i]导出资产清单[/button]
       [/div]
       [div class="table-scroll"][table class="module-table ext-table"][thead][tr][th]资产名称[/th][th]类型[/th][th]场景 / 生产任务[/th][th]规模[/th][th]质量评分[/th][th]关联模型[/th][th]质检状态[/th][th]操作[/th][/tr][/thead][tbody id="assetRows"][/tbody][/table][/div]
@@ -858,15 +1063,23 @@
     return m(`[tr class="module-row ext-asset-row" data-name="${escapeHtml(asset.name)}" data-type="${escapeHtml(asset.type)}" data-id="${escapeHtml(asset.id)}"][td][b]${escapeHtml(asset.name)}[/b][br][small style="color:#96a2b6"]${escapeHtml(asset.format)} · ${escapeHtml(asset.createdAt)}[/small][/td][td]${typeBadge(asset.type)}[/td][td]${escapeHtml(asset.scene)}[br][small]${escapeHtml(asset.taskName||asset.taskId||'未关联生产任务')}[/small]${bundle?`[br][small style="color:#78b9df"]数据包：${escapeHtml(bundle)}[/small]`:''}[/td][td]${scaleText(asset.records)}[/td][td]${score}[/td][td]${model}[/td][td]${statusBadge(asset.status)}[/td][td][div class="row-actions"][button class="btn" data-asset-qc="${escapeHtml(asset.id)}"]质检[/button][button class="btn" data-asset-model="${escapeHtml(asset.id)}"]模型[/button][button class="btn" data-asset-detail="${escapeHtml(asset.id)}"]详情[/button][/div][/td][/tr]`);
   }
   function scaleText(records){const text=String(records??'已接入');if(text==='已接入'||text==='待解析')return text;if(/条|Episode|小时|帧|GB|MB/.test(text))return escapeHtml(text);return escapeHtml(text)+' 条记录'}
+  function assetFolderValue(asset){const explicit=[asset?.sourceRoot,asset?.sourceFolder].map(value=>String(value||'').replaceAll('\\','/').replace(/^\/+|\/+$/g,'')).filter(Boolean).join('/');if(explicit)return explicit;const relative=String(asset?.relativePath||asset?.name||'').replaceAll('\\','/'),parts=relative.split('/');parts.pop();return parts.join('/')}
   function renderAssetRows(){
     const body=document.getElementById('assetRows');if(!body)return;
-    const query=(document.getElementById('assetSearch')?.value||'').toLowerCase(),type=document.getElementById('assetTypeFilter')?.value||'all',status=document.getElementById('assetStatusFilter')?.value||'all',model=document.getElementById('assetModelFilter')?.value||'all';
+    const query=(document.getElementById('assetSearch')?.value||'').toLowerCase(),type=document.getElementById('assetTypeFilter')?.value||'all',status=document.getElementById('assetStatusFilter')?.value||'all',model=document.getElementById('assetModelFilter')?.value||'all',bundleFilter=document.getElementById('assetBundleFilter')?.value||'all',folderFilter=document.getElementById('assetFolderFilter')?.value||'all';
     const assets=getAssets();
-    const rows=assets.filter(asset=>(type==='all'||asset.type===type)&&(status==='all'||asset.status===status)&&(model==='all'||asset.model===model)&&(`${asset.name} ${asset.scene} ${asset.model} ${asset.node} ${asset.taskId} ${asset.taskName}`.toLowerCase().includes(query)));
+    const filteredRows=assets.filter(asset=>(type==='all'||asset.type===type)&&(status==='all'||asset.status===status)&&(model==='all'||asset.model===model)&&(bundleFilter==='all'||asset.bundleId===bundleFilter)&&(folderFilter==='all'||assetFolderValue(asset)===folderFilter)&&(`${asset.name} ${asset.scene} ${asset.model} ${asset.node} ${asset.taskId} ${asset.taskName} ${asset.relativePath||''} ${asset.bundleName||''}`.toLowerCase().includes(query)));currentAssetFilteredIds=filteredRows.map(asset=>asset.id);const rows=filteredRows.slice(0,assetRenderLimit);
     body.innerHTML=rows.length?rows.map(assetRow).join(''):m('[tr][td colspan="8"][div class="empty-inline"]没有符合条件的资产，点击右上角「导入数据」开始[/div][/td][/tr]');
+    if(filteredRows.length>assetRenderLimit)body.insertAdjacentHTML('beforeend',`<tr><td colspan="8"><div class="empty-inline" style="padding:14px"><button class="btn" id="assetLoadMore" type="button">显示更多资产（${rows.length}/${filteredRows.length}）</button></div></td></tr>`);
     const modelSelect=document.getElementById('assetModelFilter');
     if(modelSelect)modelSelect.innerHTML=m(`[option value="all"]全部模型[/option]`)+getModels().map(item=>m(`[option value="${escapeHtml(item.id)}"]${escapeHtml(item.id)}[/option]`)).join('')+m(`[option value="未关联"]未关联[/option]`);
     if(modelSelect)modelSelect.value=model;
+    const bundleSelect=document.getElementById('assetBundleFilter'),bundles=[...new Map(assets.filter(asset=>asset.bundleId).map(asset=>[asset.bundleId,asset.bundleName||asset.bundleId])).entries()];
+    if(bundleSelect)bundleSelect.innerHTML=m(`[option value="all"]全部数据包（${bundles.length}）[/option]`)+bundles.map(([id,name])=>m(`[option value="${escapeHtml(id)}"]${escapeHtml(name)}[/option]`)).join('');
+    if(bundleSelect)bundleSelect.value=bundles.some(([id])=>id===bundleFilter)?bundleFilter:'all';
+    const folderAssets=bundleFilter==='all'?assets:assets.filter(asset=>asset.bundleId===bundleFilter),folders=[...new Set(folderAssets.map(assetFolderValue).filter(Boolean))].sort((left,right)=>left.localeCompare(right,'zh-CN')),folderSelect=document.getElementById('assetFolderFilter');
+    if(folderSelect)folderSelect.innerHTML=m(`[option value="all"]全部文件夹（${folders.length}）[/option]`)+folders.map(folder=>m(`[option value="${escapeHtml(folder)}"]${escapeHtml(folder)}[/option]`)).join('');
+    if(folderSelect)folderSelect.value=folders.includes(folderFilter)?folderFilter:'all';
     const count=value=>assets.filter(asset=>asset.type===value).length;
     const setText=(id,value)=>{const node=document.getElementById(id);if(node)node.textContent=value};
     setText('assetKpiUmi',count('UMI'));setText('assetKpiEgo',count('EGO'));setText('assetKpiTele',count('遥操'));
@@ -879,6 +1092,7 @@
       row.querySelector('[data-asset-model]').onclick=event=>{event.stopPropagation();openModelPicker(row.dataset.id)};
       if(authUser?.canDeleteData===true){const actions=row.querySelector('.row-actions'),button=document.createElement('button');button.className='btn danger';button.title='删除资产';button.innerHTML='<i data-lucide="trash-2"></i>删除';button.onclick=event=>{event.stopPropagation();deleteAsset(row.dataset.id)};actions?.appendChild(button)}
     });
+    const loadMore=document.getElementById('assetLoadMore');if(loadMore)loadMore.onclick=()=>{assetRenderLimit+=300;renderAssetRows()};
     ensureAssetBulkControls();updateAssetBulkControls();
     lucide.createIcons();
   }
@@ -889,12 +1103,15 @@
     if(pending)pending.onclick=async()=>{pending.disabled=true;try{const batch=await createQcBatch('待质检数据','标准质检','全部模型');if(!batch){showToast('当前没有待质检数据');return}renderAssetRows();showToast(`证据型质检完成：通过率 ${batch.passRate}%，发现 ${batch.issueCount} 个问题`)}catch(error){showToast(error.message)}finally{pending.disabled=false}};
     const exportButton=document.getElementById('assetExportBtn');
     if(exportButton)exportButton.onclick=()=>downloadCsv('data-assets.csv',getAssets().map(asset=>({资产名称:asset.name,类型:asset.type,采集场景:asset.scene,生产任务编号:asset.taskId||'',生产任务名称:asset.taskName||'',规模:asset.records,采集节点:asset.node,关联模型:asset.model,质量评分:asset.score||'',质检状态:asset.status,质检模板:asset.qcTemplate,标注状态:asset.annotationStatus,导入时间:asset.createdAt})));
-    ['assetSearch','assetTypeFilter','assetStatusFilter','assetModelFilter'].forEach(id=>{const node=document.getElementById(id);if(node)node.addEventListener(id==='assetSearch'?'input':'change',renderAssetRows)});
+    ['assetSearch','assetTypeFilter','assetStatusFilter','assetModelFilter','assetBundleFilter','assetFolderFilter'].forEach(id=>{const node=document.getElementById(id);if(node)node.addEventListener(id==='assetSearch'?'input':'change',()=>{assetRenderLimit=300;if(id==='assetBundleFilter'){const folder=document.getElementById('assetFolderFilter');if(folder)folder.value='all'}renderAssetRows()})});
     renderAssetRows();
   }
   function openAssetDrawer(name){
     const asset=findAsset(name);if(!asset){setDrawerData(name,'UMI');openDrawer('数据资产详情');return}
     setDrawerData(asset.name,asset.type,asset.records);openDrawer('数据资产详情');
+    const qcNode=document.getElementById('qcText'),syncNode=document.getElementById('detailSync');
+    if(qcNode&&asset.qcLimitations?.length)qcNode.textContent=`${asset.status||'待质检'} · ${asset.lastQcAt||''} · 未验证：${asset.qcLimitations.join('；')}`;
+    if(syncNode&&Number.isFinite(asset.qcDetail?.sync))syncNode.textContent=`${asset.qcDetail.sync.toFixed(1)}%`;
   }
   async function runSingleAssetQc(assetId){
     const asset=getAssets().find(item=>item.id===assetId);if(!asset)return;
@@ -905,9 +1122,10 @@
     if(!window.confirm(`确定删除资产“${asset.name}”吗？这会同时删除服务端原始文件、问题单、标注任务和质检结果，且不可恢复。`))return;
     try{const response=await fetch(`/api/assets/${encodeURIComponent(assetId)}`,{method:'DELETE'}),data=await response.json();if(!response.ok)throw new Error(data.error||'资产删除失败');saveAssets(getAssets().filter(item=>item.id!==assetId));await syncServerState();moduleTemplates.assets=assetsTemplate();showPage('assets');showToast(`资产 ${asset.name} 已删除`)}catch(error){showToast(error.message||'资产删除失败')}
   }
-  function updateAssetBulkControls(){const count=selectedAssetIds.size,badge=document.getElementById('assetBulkCount'),button=document.getElementById('assetBulkDelete');if(badge)badge.textContent=`已选择 ${count} 个`;if(button)button.disabled=!count;document.querySelectorAll('.asset-select').forEach(input=>{input.checked=selectedAssetIds.has(input.value)})}
-  function ensureAssetBulkControls(){if(authUser?.canDeleteData!==true)return;const toolbar=document.querySelector('#moduleContent .ext-toolbar');if(!toolbar||document.getElementById('assetBulkActions'))return;const box=document.createElement('div');box.id='assetBulkActions';box.style.cssText='display:flex;align-items:center;gap:6px;margin-left:auto';box.innerHTML='<span id="assetBulkCount" style="color:#7e8da3;font-size:12px">已选择 0 个</span><button class="btn" id="assetSelectAll" type="button">全选当前</button><button class="btn" id="assetClearAll" type="button">清除选择</button><button class="btn danger" id="assetBulkDelete" type="button" disabled><i data-lucide="trash-2"></i>批量删除</button>';toolbar.appendChild(box);document.getElementById('assetSelectAll').onclick=()=>{document.querySelectorAll('#assetRows .ext-asset-row').forEach(row=>selectedAssetIds.add(row.dataset.id));updateAssetBulkControls()};document.getElementById('assetClearAll').onclick=()=>{selectedAssetIds.clear();updateAssetBulkControls()};document.getElementById('assetBulkDelete').onclick=batchDeleteAssets;lucide.createIcons()}
-  async function batchDeleteAssets(){const ids=[...selectedAssetIds];if(!ids.length)return;if(!window.confirm(`确定批量删除 ${ids.length} 个资产吗？将同时删除服务端原始文件及关联质检记录，且不可恢复。`))return;const button=document.getElementById('assetBulkDelete');if(button)button.disabled=true;try{const response=await fetch('/api/assets/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})}),data=await response.json();if(!response.ok)throw new Error(data.error||'批量删除失败');selectedAssetIds.clear();saveAssets(getAssets().filter(item=>!ids.includes(item.id)));await syncServerState();moduleTemplates.assets=assetsTemplate();showPage('assets');showToast(`已批量删除 ${data.removedCount||ids.length} 个资产`)}catch(error){if(button)button.disabled=false;showToast(error.message||'批量删除失败')}}
+  function updateAssetBulkControls(){const count=selectedAssetIds.size,badge=document.getElementById('assetBulkCount'),button=document.getElementById('assetBulkDelete'),bundleFilter=document.getElementById('assetBundleFilter')?.value||'all',folderFilter=document.getElementById('assetFolderFilter')?.value||'all';if(badge)badge.textContent=`已选择 ${count} 个`;if(button)button.disabled=!count;const batch=document.getElementById('assetDeleteBatch'),folder=document.getElementById('assetDeleteFolder');if(batch)batch.disabled=bundleFilter==='all';if(folder)folder.disabled=folderFilter==='all';document.querySelectorAll('.asset-select').forEach(input=>{input.checked=selectedAssetIds.has(input.value)})}
+  function ensureAssetBulkControls(){if(authUser?.canDeleteData!==true)return;const toolbar=document.querySelector('#moduleContent .ext-toolbar');if(!toolbar||document.getElementById('assetBulkActions'))return;const box=document.createElement('div');box.id='assetBulkActions';box.style.cssText='display:flex;align-items:center;gap:6px;margin-left:auto;flex-wrap:wrap';box.innerHTML='<span id="assetBulkCount" style="color:#7e8da3;font-size:12px">已选择 0 个</span><button class="btn" id="assetSelectAll" type="button">全选当前</button><button class="btn" id="assetClearAll" type="button">清除选择</button><button class="btn danger" id="assetBulkDelete" type="button" disabled><i data-lucide="trash-2"></i>删除勾选</button><button class="btn danger" id="assetDeleteBatch" type="button" disabled>删除当前批次</button><button class="btn danger" id="assetDeleteFolder" type="button" disabled>删除当前文件夹</button>';toolbar.appendChild(box);document.getElementById('assetSelectAll').onclick=()=>{currentAssetFilteredIds.forEach(id=>selectedAssetIds.add(id));updateAssetBulkControls()};document.getElementById('assetClearAll').onclick=()=>{selectedAssetIds.clear();updateAssetBulkControls()};document.getElementById('assetBulkDelete').onclick=()=>batchDeleteAssets([...selectedAssetIds]);document.getElementById('assetDeleteBatch').onclick=()=>{const bundleId=document.getElementById('assetBundleFilter').value;deleteAssetScope({bundleId},`数据包 ${bundleId}`)};document.getElementById('assetDeleteFolder').onclick=()=>{const bundleId=document.getElementById('assetBundleFilter').value,folder=document.getElementById('assetFolderFilter').value;deleteAssetScope({...(bundleId!=='all'?{bundleId}:{}),folder},`文件夹 ${folder}`)};lucide.createIcons()}
+  async function deleteAssetScope(payload,label){if(!window.confirm(`确定删除${label}中的全部资产吗？这会删除服务端原始文件、问题单、标注记录和质检结果，且不可恢复。`))return;try{const response=await fetch('/api/assets/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),data=await response.json();if(!response.ok)throw new Error(data.error||'批量删除失败');selectedAssetIds.clear();saveAssets(data.assets||getAssets().filter(item=>!data.removed?.includes(item.id)));await syncServerState();moduleTemplates.assets=assetsTemplate();showPage('assets');showToast(`已删除 ${data.removedCount||0} 个资产 · ${data.scope||label}`)}catch(error){showToast(error.message||'批量删除失败')}}
+  async function batchDeleteAssets(ids){if(!ids?.length)return;if(ids.length>500){const bundleId=document.getElementById('assetBundleFilter')?.value||'all',folder=document.getElementById('assetFolderFilter')?.value||'all';if(bundleId!=='all'||folder!=='all')return deleteAssetScope({...(bundleId!=='all'?{bundleId}:{}),...(folder!=='all'?{folder}:{})},bundleId!=='all'?`数据包 ${bundleId}`:`文件夹 ${folder}`);showToast('单次勾选删除上限为 500 个；请先按数据包或文件夹筛选后再整批删除');return}if(!window.confirm(`确定批量删除 ${ids.length} 个资产吗？将同时删除服务端原始文件及关联质检记录，且不可恢复。`))return;const button=document.getElementById('assetBulkDelete');if(button)button.disabled=true;try{const response=await fetch('/api/assets/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})}),data=await response.json();if(!response.ok)throw new Error(data.error||'批量删除失败');selectedAssetIds.clear();saveAssets(getAssets().filter(item=>!ids.includes(item.id)));await syncServerState();moduleTemplates.assets=assetsTemplate();showPage('assets');showToast(`已批量删除 ${data.removedCount||ids.length} 个资产`)}catch(error){if(button)button.disabled=false;showToast(error.message||'批量删除失败')}}
   function detectType(name){
     const text=String(name).toLowerCase();
     if(/umi/.test(text))return {type:'UMI',reason:'文件名包含 UMI',confident:true};
@@ -922,7 +1140,7 @@
     if(folders.some(part=>/^(video|videos|image|images|camera|cameras|media|rgb|depth)$/.test(part)))return 'media';
     if(folders.some(part=>/^(data|trajectory|trajectories|record|records|state|states|action|actions)$/.test(part)))return 'trajectory';
     if(/\.(mp4|mov|webm|avi|mkv|jpg|jpeg|png)$/.test(name))return 'media';
-    if(/(^|[_-])(info|stats|schema|modality|manifest|task|episodes?)([_\-.]|$)/.test(name))return 'meta';
+    if(/(^|[_-])(info|stats|schema|modality|manifest|task|episodes?|annotations?)([_\-.]|$)/.test(name))return 'meta';
     return 'trajectory';
   }
   function isImportNoise(file){const name=String(file.name||'').toLowerCase();return !name||name==='thumbs.db'||name==='desktop.ini'||name==='.ds_store'||name.startsWith('._')}
@@ -937,16 +1155,29 @@
     const group=IMPORT_GROUPS.find(item=>item.id===role)||IMPORT_GROUPS[1];
     return `[div class="import-file"][div class="import-file-main"][b]${escapeHtml(file.name)}[/b][small class="ok"]${(file.size/1048576).toFixed(2)} MB${path} · 当前归入${group.label}[/small][/div][select class="filter-select import-role" data-index="${index}">${importRoleOptions(role)}</select][button class="btn" type="button" data-remove-file="${index}" style="padding:5px 8px"]移除[/button][/div]`;
   }
-  function importPresetSpec(type,preset){return (IMPORT_PRESETS[type]||[]).find(item=>item.id===preset)||{id:'single',label:'单文件 / 多文件兼容导入',required:false}}
+  function importPresetSpec(type,preset){return (IMPORT_PRESETS[type]||[]).find(item=>item.id===preset)||formatPreset('single')}
+  function refreshImportPreset(state){
+    if(!state)return null;
+    const catalog=IMPORT_PRESETS[state.type]||FORMAT_IMPORT_PRESETS, availablePresetIds=catalog.map(item=>item.id), detector=globalThis.PlatformImportDetection;
+    let detection;
+    if(detector?.resolvePreset){detection=detector.resolvePreset({files:state.files||[],roles:state.roles||[],mode:state.presetMode==='manual'?'manual':'auto',manualPreset:state.preset,availablePresetIds});}
+    else {
+      const names=(state.files||[]).map(file=>String(file.name||'').toLowerCase()), hdf5=names.some(name=>/\.(h5|hdf5)$/.test(name)), mcap=names.some(name=>/\.(mcap|bag)$/.test(name)), parquet=names.some(name=>/\.parquet$/.test(name));
+      const automaticPreset=hdf5?'hdf5':mcap?'mcap':parquet?'parquet':'single', available=new Set(availablePresetIds), manual=state.presetMode==='manual'&&available.has(state.preset), preset=manual?state.preset:available.has(automaticPreset)?automaticPreset:'single';
+      detection={preset,mode:manual?'manual':'auto',automaticPreset,format:automaticPreset==='hdf5'?'HDF5':automaticPreset==='mcap'?'MCAP':automaticPreset==='parquet'?'Parquet':'通用',confidence:automaticPreset==='single'?'low':'high',reason:hdf5?'检测到 HDF5 文件。':mcap?'检测到 MCAP / ROS Bag 文件。':parquet?'检测到 Parquet 文件。':'使用兼容导入模式。'};
+    }
+    state.preset=detection.preset;state.presetMode=detection.mode;state.presetResolution=detection;
+    return detection;
+  }
   function importBundleSummary(state){
-    const counts=Object.fromEntries(IMPORT_GROUPS.map(group=>[group.id,0]));state.roles.forEach(role=>{if(counts[role]!=null)counts[role]+=1});
-    return IMPORT_GROUPS.map(group=>`[div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 10px;border:1px solid rgba(120,150,190,.18);border-radius:7px;background:rgba(15,30,52,.36)"][div style="min-width:0"][b]${group.label}[/b][small style="display:block;color:#8f9db1;margin-top:2px"]${group.hint} · ${counts[group.id]} 个文件[/small][/div][div style="display:flex;gap:6px;flex-shrink:0"][button class="btn" type="button" data-add-group="${group.id}" style="padding:5px 8px"]添加文件[/button][button class="btn" type="button" data-add-folder="${group.id}" style="padding:5px 8px"]选择文件夹[/button][/div][/div]`).join('');
+    return IMPORT_GROUPS.map(group=>`[div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 10px;border:1px solid rgba(120,150,190,.18);border-radius:7px;background:rgba(15,30,52,.36)"][div style="min-width:0"][b]${group.label}[/b][small style="display:block;color:#8f9db1;margin-top:2px"]${group.hint}[/small][/div][div style="display:flex;gap:6px;flex-shrink:0"][button class="btn" type="button" data-add-group="${group.id}" style="padding:5px 8px"]添加文件[/button][button class="btn" type="button" data-add-folder="${group.id}" style="padding:5px 8px"]选择文件夹[/button][/div][/div]`).join('');
   }
   function addImportFiles(role,files){
     const state=globalThis.importWizardState;if(!state)return;
     captureImportDraft();
     const existing=new Set(state.files.map(file=>`${file.webkitRelativePath||file.name}|${file.size}|${file.lastModified||0}`));
     [...files].forEach(file=>{const key=`${file.webkitRelativePath||file.name}|${file.size}|${file.lastModified||0}`;if(existing.has(key))return;existing.add(key);state.files.push(file);state.roles.push(role)});
+    refreshImportPreset(state);
     renderImportWizard();showToast(`已加入 ${role==='meta'?'meta':role==='trajectory'?'data':'video'} 文件组`);
   }
   function openImportGroupPicker(role,folder=false){
@@ -960,24 +1191,28 @@
   }
   function renderImportWizard(){
     const state=globalThis.importWizardState;if(!state)return;
-    const type=state.type,presetSpec=importPresetSpec(type,state.preset),draft=state.draft||{},box=document.getElementById('importWizard'),folder=analyzeImportFolder(state.files,state.roles);
-    const rows=state.files.map((file,index)=>importFileRow(file,index,state.roles[index])).join('');
+    const detection=refreshImportPreset(state),type=state.type,presetSpec=importPresetSpec(type,state.preset),draft=state.draft||{},box=document.getElementById('importWizard'),folder=analyzeImportFolder(state.files,state.roles),automaticSpec=importPresetSpec(type,detection?.automaticPreset);
+    const rows=state.files.slice(0,20).map((file,index)=>importFileRow(file,index,state.roles[index])).join('');
     const typeOptions=`[option value=""${type?'':' selected'}]请选择数据类型[/option]`+DATA_TYPES.map(item=>`[option value="${item}"${item===type?' selected':''}]${item}[/option]`).join('');
-    const presetOptions=(IMPORT_PRESETS[type]||[]).map(item=>`[option value="${item.id}"${item.id===state.preset?' selected':''}]${item.label}[/option]`).join('');
+    const presetCatalog=IMPORT_PRESETS[type]||FORMAT_IMPORT_PRESETS,confidenceLabel={high:'高置信度',medium:'中置信度',low:'低置信度'}[detection?.confidence]||'待判断';
+    const autoOption=`[option value="__auto__"${state.presetMode!=='manual'?' selected':''}]自动识别 · ${escapeHtml(automaticSpec?.label||'兼容导入')}（${confidenceLabel}）[/option]`;
+    const presetOptions=autoOption+presetCatalog.map(item=>`[option value="${item.id}"${state.presetMode==='manual'&&item.id===state.preset?' selected':''}]${escapeHtml(item.label)}[/option]`).join('');
     const modelOptions=getModels().map(item=>`[option value="${escapeHtml(item.id)}"]`).join('');
     const registeredNodes=extRead('embodiedNodes',[]),nodeOptions=['[option value="未绑定"]未绑定采集节点[/option]',...registeredNodes.map(node=>`[option value="${escapeHtml(node.id)}"${node.id===draft.importNode?' selected':''}]${escapeHtml(node.id)} · ${escapeHtml(node.type)} · ${escapeHtml(node.site)} · ${escapeHtml(node.status)}[/option]`)].join('');
     const activeTasks=readStore(storageKey.tasks).filter(task=>!['待验收','已完成'].includes(task.status)),taskOptions=['[option value=""]不归属采集任务[/option]',...activeTasks.map(task=>`[option value="${escapeHtml(task.id)}"${task.id===draft.importTask?' selected':''}]${escapeHtml(task.id)} · ${escapeHtml(task.type)} · ${escapeHtml(task.name)}[/option]`)].join('');
     box.innerHTML=m(`
       [div class="search-box" style="width:min(820px,calc(100vw - 30px))"]
-        [div class="popover-head"][span]总文件夹导入 · 共 ${state.files.length} 个文件[/span][button class="close" id="importWizardClose"][i data-lucide="x"][/i][/button][/div]
+        [div class="popover-head"][span]总文件夹导入[/span][button class="close" id="importWizardClose"][i data-lucide="x"][/i][/button][/div]
         [div style="padding:17px;max-height:70vh;overflow:auto"]
-          [div class="issue-evidence" style="margin-bottom:16px"][b]${folder.rootName?`已识别根目录：${escapeHtml(folder.rootName)}`:'请添加数据集文件' }[/b][span]${folder.structured?`子目录：${escapeHtml(folder.topFolders.join('、'))}`:'系统将依据目录名和文件格式识别分组'}[/span][p]识别结果：meta ${folder.counts.meta} 个 · data ${folder.counts.trajectory} 个 · video ${folder.counts.media} 个${folder.complete?' · 三组完整':' · 仍有分组缺失'}</p][/div]
+          [div class="issue-evidence" style="margin-bottom:16px"][b]${folder.rootName?`已识别根目录：${escapeHtml(folder.rootName)}`:'请添加数据集文件' }[/b][span]${folder.structured?`子目录：${escapeHtml(folder.topFolders.join('、'))}`:'系统将依据目录名和文件格式识别分组'}[/span][p]${folder.complete?'meta、data、video 三组已自动识别完整':'仍缺少部分 meta、data 或 video 分组'}</p][/div]
           [div class="panel-title" style="font-size:12px"]1. 数据类型与格式预设[/div]
-          [div class="panel-sub" style="margin-bottom:11px"]系统会根据总目录名自动判断 UMI、EGO 或遥操；无法可靠判断时才需要手工选择。[/div]
+          [div class="panel-sub" style="margin-bottom:11px"]系统根据目录名、扩展名和三组结构判断数据类型与数据包预设；数据类型和预设均可手动切换。[/div]
           [div class="form-row"][div][label]数据类型 <span style="color:#eea76a">*</span>[/label][select class="select" style="width:100%" id="importDataType"]${typeOptions}[/select][/div][div][label]数据包预设 <span style="color:#eea76a">*</span>[/label][select class="select" style="width:100%" id="importPreset"]${presetOptions||'[option]请选择数据类型[/option]'}[/select][/div][/div]
-          [div class="panel-sub" style="margin:8px 0 14px"]${escapeHtml(presetSpec.label)}：${presetSpec.required?'必须包含三组文件后才能提交。':'允许单组或多组文件，系统仍会记录文件组关系。'}[/div]
+          [div class="issue-evidence" style="margin:10px 0 14px"][b]${state.presetMode==='manual'?'手动覆盖':'自动识别'} · ${escapeHtml(automaticSpec?.label||presetSpec.label)}[/b][span]${confidenceLabel} · 当前预设：${escapeHtml(presetSpec.label)}[/span][p]${escapeHtml(detection?.reason||'等待文件识别')}[/p][/div]
+          [div class="panel-sub" style="margin:8px 0 14px"]${escapeHtml(presetSpec.description||'')} ${presetSpec.required?'必须包含三组文件后才能提交。':'允许单组或多组文件；手动选择后会保持覆盖。'}[/div]
           [div class="panel-title" style="font-size:12px"]2. 文件分组 <button class="btn" style="float:right;padding:4px 9px;font-size:11px" id="importAutoGroup" type="button">按路径自动分组</button>[/div]
           [div class="panel-sub" style="margin-bottom:11px"]已按相对路径自动识别 meta、data、video/videos 子目录。只有目录命名不规范时才需要在下方手工调整或补充文件。[/div]
+          [div class="panel-sub" style="margin:4px 0 8px"]仅预览前 20 项；大批量文件由系统自动分组，不在界面逐项加载。[/div]
           [div class="check-list" style="padding:0"]${rows}[/div]
           [div style="display:grid;gap:7px;margin-top:10px"]${importBundleSummary(state)}[/div]
           [details class="import-advanced"][summary]高级设置（可选） · 批次信息、节点、模型和质检策略[/summary]
@@ -994,19 +1229,20 @@
     box.classList.add('show');lucide.createIcons();
     document.getElementById('importWizardClose').onclick=()=>box.classList.remove('show');
     document.getElementById('importWizardCancel').onclick=()=>box.classList.remove('show');
-    document.getElementById('importDataType').onchange=event=>{captureImportDraft();state.type=event.target.value;state.preset=(IMPORT_PRESETS[state.type]||[])[0]?.id||'single';renderImportWizard()};
-    document.getElementById('importPreset').onchange=event=>{captureImportDraft();state.preset=event.target.value;renderImportWizard()};
+    document.getElementById('importDataType').onchange=event=>{captureImportDraft();state.type=event.target.value;refreshImportPreset(state);renderImportWizard()};
+    document.getElementById('importPreset').onchange=event=>{captureImportDraft();if(event.target.value==='__auto__')state.presetMode='auto';else{state.preset=event.target.value;state.presetMode='manual'}refreshImportPreset(state);renderImportWizard()};
     document.querySelectorAll('.import-role').forEach(select=>select.onchange=event=>{state.roles[Number(event.target.dataset.index)]=event.target.value;renderImportWizard()});
-    document.querySelectorAll('[data-remove-file]').forEach(button=>button.onclick=()=>{captureImportDraft();const index=Number(button.dataset.removeFile);state.files.splice(index,1);state.roles.splice(index,1);renderImportWizard()});
+    document.querySelectorAll('[data-remove-file]').forEach(button=>button.onclick=()=>{captureImportDraft();const index=Number(button.dataset.removeFile);state.files.splice(index,1);state.roles.splice(index,1);refreshImportPreset(state);renderImportWizard()});
     document.querySelectorAll('[data-add-group]').forEach(button=>button.onclick=()=>openImportGroupPicker(button.dataset.addGroup,false));
     document.querySelectorAll('[data-add-folder]').forEach(button=>button.onclick=()=>openImportGroupPicker(button.dataset.addFolder,true));
-    document.getElementById('importAutoGroup').onclick=()=>{state.roles=state.files.map(file=>detectImportGroup(file));renderImportWizard();showToast('已按文件路径和扩展名自动完成分组')};
+    document.getElementById('importAutoGroup').onclick=()=>{state.roles=state.files.map(file=>detectImportGroup(file));refreshImportPreset(state);renderImportWizard();showToast('已按文件路径和扩展名自动完成分组')};
     document.getElementById('importWizardSubmit').onclick=confirmImport;
   }
   function openImportWizard(files){
     const list=[...files].filter(file=>!isImportNoise(file));if(!list.length){showToast('所选文件夹没有可导入的数据文件');return}
-    const roles=list.map(file=>detectImportGroup(file)),folder=analyzeImportFolder(list,roles),detectSource=[folder.rootName,...folder.topFolders,...list.slice(0,20).map(file=>file.name)].join(' '),detected=detectType(detectSource),type=detected.confident?detected.type:'',preset=folder.complete?(type==='遥操'?'lerobot-v21':'standard-3'):((IMPORT_PRESETS[type]||[])[0]?.id||'single');
-    globalThis.importWizardState={files:list,roles,type,preset,draft:{importBundleName:folder.rootName||'',importScene:folder.rootName||'',importTemplate:'标准质检',importAnnotation:'未标注',importRunQc:'yes'},folder};
+    const roles=list.map(file=>detectImportGroup(file)),folder=analyzeImportFolder(list,roles),detectSource=[folder.rootName,...folder.topFolders,...list.slice(0,20).map(file=>file.name)].join(' '),detected=detectType(detectSource),type=detected.confident?detected.type:'';
+    const state={files:list,roles,type,typeDetection:detected,preset:'single',presetMode:'auto',draft:{importBundleName:folder.rootName||'',importScene:folder.rootName||'',importTemplate:'标准质检',importAnnotation:'未标注',importRunQc:'yes'},folder};
+    refreshImportPreset(state);globalThis.importWizardState=state;
     renderImportWizard();
   }
   function startImportWizard(){
@@ -1017,8 +1253,11 @@
   async function confirmImport(){
     const state=globalThis.importWizardState||{files:[],roles:[],type:'',preset:'single',draft:{}};
     captureImportDraft();
+    refreshImportPreset(state);
     const files=state.files,type=state.type,preset=state.preset,presetSpec=importPresetSpec(type,preset),roleCounts=Object.fromEntries(IMPORT_GROUPS.map(group=>[group.id,0]));state.roles.forEach(role=>{if(roleCounts[role]!=null)roleCounts[role]+=1});
     if(!files.length){showToast('请至少添加一个数据文件或文件夹');return}
+    const hdf5Count=files.filter(file=>/\.(?:h5|hdf5)$/i.test(file.name)).length;
+    if(hdf5Count>200&&hdf5Count===files.length){showToast(`检测到 ${hdf5Count} 个逐帧 HDF5 文件，请改用“服务端目录导入”，避免创建 ${hdf5Count} 个浏览器上传任务`);return}
     if(!type){showToast('请选择本批数据的真实类型（UMI、EGO 或遥操）');document.getElementById('importDataType')?.focus();return}
     const missingRoles=presetSpec.required?IMPORT_GROUPS.filter(group=>!roleCounts[group.id]):[];
     if(missingRoles.length){showToast(`${presetSpec.label}缺少：${missingRoles.map(group=>group.label).join('、')}，请为每组至少选择一个文件`);return}
@@ -1026,19 +1265,60 @@
     if(task&&task.type!==type){showToast(`采集任务 ${task.id} 仅接收 ${task.type} 数据`);return}
     if(registeredNode&&registeredNode.type!==type){showToast(`采集节点 ${node} 仅接收 ${registeredNode.type} 数据`);return}
     const linkedModel=modelOf(model);if(linkedModel&&linkedModel.type!==type){showToast(`模型 ${model} 仅支持 ${linkedModel.type} 数据，请调整数据类型或模型`);return}
-    const draftKey=`embodiedImportDraft:${authUser.id}`,fingerprint=files.map(file=>`${file.webkitRelativePath||file.name}|${file.size}|${file.lastModified}`).join('\n'),prior=extRead(draftKey,null);if(prior&&prior.fingerprint===fingerprint&&prior.type===type&&!state.resumeBundleId){state.resumeBundleId=prior.bundleId;state.assetIds=prior.assetIds;return confirmImport()}if(state.draftFingerprint&&state.draftFingerprint!==fingerprint){state.resumeBundleId='';state.assetIds=null;state.draftFingerprint=fingerprint;return confirmImport()}state.draftFingerprint=fingerprint;state.resumeBundleId=bundleId;state.assetIds=state.assetIds||files.map(()=>`AST-${uploadIdentity()}`);extWrite(draftKey,{fingerprint,type,bundleId,assetIds:state.assetIds});
+    const draftKey=`embodiedImportDraft:${authUser.id}`,fingerprint=importFileFingerprint(files),prior=extRead(draftKey,null);
+    if(prior&&prior.version===2&&prior.fingerprint===fingerprint&&prior.type===type&&!state.resumeBundleId){state.resumeBundleId=prior.bundleId;state.draftFingerprint=fingerprint;return confirmImport()}
+    if(prior&&!prior.version&&prior.type===type&&Array.isArray(prior.assetIds)&&prior.assetIds.length===files.length&&!state.resumeBundleId){
+      const legacyFingerprint=files.map(file=>`${file.webkitRelativePath||file.name}|${file.size}|${file.lastModified}`).join('\n');
+      if(prior.fingerprint===legacyFingerprint){state.resumeBundleId=prior.bundleId;state.assetIds=prior.assetIds;state.draftFingerprint=fingerprint;state.legacyDraft=true;return confirmImport()}
+    }
+    if(state.draftFingerprint&&state.draftFingerprint!==fingerprint){state.resumeBundleId='';state.assetIds=null;state.legacyDraft=false;state.draftFingerprint=fingerprint;return confirmImport()}
+    state.draftFingerprint=fingerprint;state.resumeBundleId=state.resumeBundleId||bundleId;state.assetIds=state.assetIds||importAssetIds(state.resumeBundleId,files.length);
+    if(!state.legacyDraft)extWrite(draftKey,{version:2,fingerprint,type,bundleId:state.resumeBundleId});
     const button=document.getElementById('importWizardSubmit');button.disabled=true;button.textContent='正在解析并上传数据包…';
-    const created=[];
-    try{for(let index=0;index<files.length;index+=1){
-      const file=files[index],role=state.roles[index],roleInfo=IMPORT_GROUPS.find(group=>group.id===role)||IMPORT_GROUPS[1];
-      button.textContent=`正在上传 ${index+1}/${files.length} · ${roleInfo.label}`;
-      let records='已接入',inspection=null;try{const summary=await summarizeImport(file);records=summary.records;inspection=summary.inspection||null}catch{records='已接入'}
-      const relativePath=file.webkitRelativePath||file.name,pathParts=importPathParts(file),mediaMetadata=await inspectMediaFile(file),localRecord={id:state.assetIds[index],name:file.name,type,size:file.size,format:(file.name.split('.').pop()||'file').toUpperCase(),records,inspection,mediaMetadata,scene,node,taskId,taskName:task?.name||'',model,qcTemplate:template,annotationStatus,createdAt:nowLabel(),score:0,status:'待质检',lastQcAt:'',bundleId,bundleName,bundlePreset:preset,bundleRole:role,bundleRoleLabel:roleInfo.label,bundleFileIndex:index+1,bundleFileCount:files.length,relativePath,sourceRoot:folder.rootName||'',sourceFolder:pathParts.length>2?pathParts[1]:role};
-      const serverRecord=globalThis.platformUploadAsset?await globalThis.platformUploadAsset(file,localRecord):null;created.push(serverRecord?{...localRecord,...serverRecord}:localRecord);
-    }}catch(error){button.disabled=false;button.textContent='继续上传未完成文件';await syncServerState();showToast(`${error.message||'上传失败'}；已上传文件和分片已保留。刷新后重新选择同一文件夹可续传。`);return}
+    const seededRecords=files.map((file,index)=>{const role=state.roles[index],roleInfo=IMPORT_GROUPS.find(group=>group.id===role)||IMPORT_GROUPS[1],relativePath=file.webkitRelativePath||file.name,pathParts=importPathParts(file);return{__registered:true,id:state.assetIds[index],name:file.name,type,size:file.size,format:(file.name.split('.').pop()||'file').toUpperCase(),records:'已接入',inspection:null,mediaMetadata:null,scene,node,taskId,taskName:task?.name||'',model,qcTemplate:template,annotationStatus,createdAt:nowLabel(),score:0,status:'待质检',lastQcAt:'',bundleId,bundleName,bundlePreset:preset,bundlePresetSource:state.presetMode,bundlePresetReason:state.presetResolution?.reason||'',bundleRole:role,bundleRoleLabel:roleInfo.label,bundleFileIndex:index+1,bundleFileCount:files.length,relativePath,sourceRoot:folder.rootName||'',sourceFolder:pathParts.length>2?pathParts[1]:role}});
+    let registrationPromise=null;
+    const ensureAssetsRegistered=()=>registrationPromise||=(async()=>{const response=await rawFetch('/api/assets/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bundleId,compact:true,assets:seededRecords.map(({__registered,...record})=>record)})}),data=await response.json();if(!response.ok)throw new Error(data.error||'批量登记数据资产失败');return true})();
+    const results=new Array(files.length),active=new Map(),deferred=[],totalBytes=files.reduce((sum,file)=>sum+file.size,0),uploadStarted=Date.now();let annotationAnalysis=null,created=[],cursor=0,completed=0,finishedBytes=0,failure=null;
+    const renderUploadProgress=()=>{const transferred=finishedBytes+[...active.values()].reduce((sum,value)=>sum+value,0),ratio=transferred/Math.max(1,totalBytes),percent=ratio>=0.1?Math.round(ratio*100):Number((ratio*100).toFixed(2)),rate=transferred/Math.max(0.25,(Date.now()-uploadStarted)/1000)/1048576;button.textContent=`正在上传 · ${percent}% · ${rate.toFixed(1)} MB/s`};
+    const worker=async()=>{
+      while(!failure){
+        const index=cursor++;if(index>=files.length)return;
+        const file=files[index],role=state.roles[index],roleInfo=IMPORT_GROUPS.find(group=>group.id===role)||IMPORT_GROUPS[1];active.set(index,0);renderUploadProgress();
+        try{
+          let records='已接入',inspection=null;try{const summary=await summarizeImport(file);records=summary.records;inspection=summary.inspection||null}catch{records='已接入'}
+          const mediaMetadata=await inspectMediaFile(file),localRecord={...seededRecords[index],records,inspection,mediaMetadata};
+          const uploadRecord=globalThis.platformUploadAsset?await globalThis.platformUploadAsset(file,localRecord,progress=>{active.set(index,progress.offset);renderUploadProgress()},{deferComplete:true,session:startedUploads.get(state.assetIds[index])}):null;
+          if(uploadRecord?.deferred)deferred.push({index,localRecord,session:uploadRecord.session});
+          else results[index]=uploadRecord?{...localRecord,...uploadRecord}:localRecord;
+          finishedBytes+=file.size;completed++;active.delete(index);renderUploadProgress();
+        }catch(error){failure||=error;active.delete(index);renderUploadProgress();return}
+      }
+    };
+    try{
+      button.textContent='正在准备上传任务…';
+      await ensureAssetsRegistered();
+      const prepared=await rawFetch('/api/uploads/batch-start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({files:files.map((file,index)=>({assetId:state.assetIds[index],name:file.name,size:file.size,key:uploadKey(file)}))})}),preparedData=await prepared.json();
+      if(!prepared.ok)throw new Error(preparedData.error||'创建批量上传任务失败');
+      const startedUploads=new Map((preparedData.uploads||[]).map(upload=>[upload.assetId,upload]));
+      if(startedUploads.size!==files.length)throw new Error('批量上传任务创建不完整');
+      await Promise.all(Array.from({length:Math.min(6,files.length)},worker));if(failure)throw failure;
+      let finalized=0;
+      button.textContent=`正在校验并入库 · 0/${deferred.length}`;
+      for(let start=0;start<deferred.length;start+=1000){
+        const batch=deferred.slice(start,start+1000),response=await rawFetch('/api/uploads/complete-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionIds:batch.map(item=>item.session.id)})}),data=await response.json();
+        if(!response.ok)throw new Error(data.error||'批量校验入库失败');
+        const assets=new Map((data.assets||[]).map(asset=>[asset.id,asset]));
+        for(const item of batch){const asset=assets.get(item.localRecord.id);if(!asset)throw new Error(`文件 ${item.localRecord.name} 入库结果缺失`);results[item.index]={...item.localRecord,...asset};syncLocalUploadTask({...item.session,status:'complete'},'succeeded');finalized++}
+        button.textContent=`正在校验并入库 · ${finalized}/${deferred.length}`;
+        await new Promise(resolve=>setTimeout(resolve,0));
+      }
+      created=results.filter(Boolean);
+    }catch(error){button.disabled=false;button.textContent='继续上传未完成文件';await syncServerState();showToast(`${error.message||'上传失败'}；已上传文件和分片已保留。刷新后重新选择同一文件夹可续传。`);return}
+    try{const response=await rawFetch('/api/imports/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bundleId})}),data=await response.json();if(response.ok)annotationAnalysis=data}catch(error){console.warn('[platform-import] annotation analysis unavailable',error.message)}
     localStorage.removeItem(draftKey);
-    saveAssets([...getAssets().filter(asset=>!created.some(item=>item.id===asset.id)),...created]);addAudit('导入数据包',bundleName,`${created.length} 个文件 · ${type} · ${presetSpec.label} · ${bundleId} · 任务 ${taskId||'未关联'} · 模型 ${model}`);document.getElementById('importWizard').classList.remove('show');if(currentPage==='assets')showPage('assets');
+    saveAssets([...getAssets().filter(asset=>!created.some(item=>item.id===asset.id)),...created]);addAudit('导入数据包',bundleName,`${created.length} 个文件 · ${type} · ${presetSpec.label} · ${state.presetMode==='manual'?'手动预设':'自动识别'} · ${bundleId} · 任务 ${taskId||'未关联'} · 模型 ${model}`);document.getElementById('importWizard').classList.remove('show');if(currentPage==='assets')showPage('assets');
     let message=`已导入数据包「${bundleName}」：${created.length} 个文件，${type}`;
+    if(annotationAnalysis?.imported)message+=` · 自动标注 ${annotationAnalysis.imported}/${annotationAnalysis.episodes||annotationAnalysis.imported} 个 Episode`;
     if(autoQc){const batch=await createQcBatch('本次导入数据包',template,model||'全部模型',created.map(item=>item.id));if(currentPage==='assets')renderAssetRows();if(batch)message+=` · 证据型质检通过率 ${batch.passRate}%，${batch.issueCount} 个问题`}
     await syncServerState();showToast(message);
   }
@@ -1480,7 +1760,7 @@
   document.getElementById('rangeSelect')?.remove();
   document.getElementById('trendDetail').onclick=()=>navigate('runs',document.querySelector('.nav button[data-page="runs"]'));
   document.getElementById('refreshBtn').onclick=async()=>{const button=document.getElementById('refreshBtn');button.disabled=true;try{const response=await fetch('/api/state',{cache:'no-store'});if(!response.ok)throw new Error('服务端数据读取失败');await syncServerState();showToast('已从服务端刷新数据')}catch(error){showToast(error.message)}finally{button.disabled=false}};
-  initAuth().then(authenticated=>{if(authenticated){syncServerState();fetch('/api/state',{cache:'no-store'}).then(response=>response.ok?response.json():null).then(remote=>{if(remote)extWrite('embodiedRuns',remote.runs||[])})}});
+  initAuth().then(authenticated=>{if(authenticated)syncServerState()});
   moduleTemplates.intake=intakeTemplate();moduleTemplates.workflow=workflowTemplate();moduleTemplates.assets=assetsTemplate();moduleTemplates.tasks=tasksTemplate();moduleTemplates.qc=qcPageTemplate();moduleTemplates.runs=runsTemplate();moduleTemplates.models=modelsTemplate();moduleTemplates.episodes=episodeTemplate();moduleTemplates.annotation=annotationTemplate();moduleTemplates.jobs=jobsTemplate();moduleTemplates.exports=exportsTemplate();moduleTemplates.datasets=datasetsTemplate();moduleTemplates.training=trainingTemplate();moduleTemplates.nodes=nodesTemplate();moduleTemplates.users=usersTemplate();moduleTemplates.audit=auditTemplate();moduleTemplates.issues=issuesTemplate();moduleTemplates.quality=qualityRulesTemplate();
   const priorShowPage=showPage;
   showPage=function(key){

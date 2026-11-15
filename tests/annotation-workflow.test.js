@@ -5,7 +5,7 @@ const test = require('node:test');
 
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(root, 'serve.js'), 'utf8').replace(/\r\n/g, '\n');
-const definitions = source.split('\nensureStorage();\nconst startupState =')[0];
+const definitions = source.split('\nensureStorage();')[0];
 const { annotationApproved, applyAnnotationUpdate, applyAnnotationStandard, submitAnnotationStandards, annotationGroupEpisodeStats, annotationGroupFlow, annotationGroupSignals, bundleGate, generateAnnotationTasks, ROLE_POLICIES, ALL_PERMISSIONS } = new Function(
   'require', '__dirname', 'process', 'Buffer',
   `${definitions}\nreturn { annotationApproved, applyAnnotationUpdate, applyAnnotationStandard, submitAnnotationStandards, annotationGroupEpisodeStats, annotationGroupFlow, annotationGroupSignals, bundleGate, generateAnnotationTasks, ROLE_POLICIES, ALL_PERMISSIONS };`,

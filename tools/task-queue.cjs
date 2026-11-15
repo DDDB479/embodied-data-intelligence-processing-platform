@@ -9,7 +9,7 @@ class TaskQueue {
   list() { return this.store.read('jobs'); }
   enqueue(kind, payload, user, retryOf = null) {
     const key = crypto.createHash('sha256').update(JSON.stringify([kind, payload, user.id])).digest('hex');
-    const jobs = this.list(), duplicate = jobs.find(job => job.key === key && ['queued', 'running'].includes(job.status));
+    const jobs = this.list(), duplicate = jobs.find(job => job.key === key && ['queued', 'running', 'paused'].includes(job.status));
     if (duplicate) return duplicate;
     const job = { id: `JOB-${crypto.randomUUID()}`, key, kind, payload, userId: user.id, userName: user.name, sessionVersion: user.sessionVersion, status: 'queued', completed: 0, total: 0, message: '等待执行', createdAt: new Date().toISOString(), retryOf };
     jobs.unshift(job); this.store.write('jobs', jobs); this.schedule(); return job;
@@ -18,6 +18,30 @@ class TaskQueue {
     const jobs = this.list(), job = jobs.find(item => item.id === id);
     if (!job) throw new Error('后台任务不存在');
     Object.assign(job, patch); this.store.write('jobs', jobs); return job;
+  }
+  pause(id) {
+    const jobs = this.list(), job = jobs.find(item => item.id === id);
+    if (!job) throw new Error('后台任务不存在');
+    if (job.status === 'running') { const error = new Error('运行中的任务需要等待当前处理结束后才能暂停'); error.status = 409; throw error; }
+    if (job.status !== 'queued') throw new Error('只有排队中的任务可以暂停');
+    Object.assign(job, { status: 'paused', pausedAt: new Date().toISOString(), message: '任务已暂停，等待继续' });
+    this.store.write('jobs', jobs); return job;
+  }
+  resume(id) {
+    const jobs = this.list(), job = jobs.find(item => item.id === id);
+    if (!job) throw new Error('后台任务不存在');
+    if (job.status !== 'paused') throw new Error('只有已暂停的任务可以继续');
+    Object.assign(job, { status: 'queued', resumedAt: new Date().toISOString(), message: '任务已继续，等待执行' });
+    this.store.write('jobs', jobs); this.schedule(); return job;
+  }
+  remove(id) {
+    const jobs = this.list(), job = jobs.find(item => item.id === id);
+    if (!job) throw new Error('后台任务不存在');
+    if (job.status === 'running') { const error = new Error('运行中的任务不能直接删除'); error.status = 409; throw error; }
+    const remaining = jobs.filter(item => item.id !== id);
+    this.store.track(remaining, 'jobs', jobs);
+    this.store.write('jobs', remaining);
+    return job;
   }
   schedule() { if (!this.stopped) setImmediate(() => this.drain()); }
   async drain() {

@@ -20,10 +20,12 @@
 | 批次工作台 | 聚合文件完整性、质检、问题、审核和验收门禁，并展示 V6 节点可用状态 |
 | 质量检测 | 服务端规则检查、质检批次、问题证据；LeRobot / Parquet 深度检查需要 Python 环境 |
 | 问题处理 | 按资产定位检测项，分配处置、填写说明、执行复检；保留问题状态与处理记录 |
-| 标注与审核 | 单一工作台按“选择范围 → 统一标准 → 批量送审 → 异常处理/审核”推进；队列信号、格式链路和记录级异常复核集中在同一页 |
-| 任务中心 | 统一查看后台执行任务、业务待办、失败重试和执行日志；导入、质检、标注、转换、交付共享入口 |
+| 标注与审核 | 自动解析 `annotations.jsonl`、LeRobot `episodes.jsonl` / `tasks.jsonl` 并按 Episode 继承；未覆盖范围才进入“选择范围 → 统一标准 → 批量送审 → 异常处理/审核” |
+| 任务中心 | 按生产任务或数据包展示上传、清洗、质检、标注、转换全流程进度，同时保留后台执行任务、业务待办、失败重试和执行日志 |
+| Episode 预览 | HDF5 逐帧 Episode 按需生成四路同步 H.264 预览、首中末缩略图和可清理缓存 |
 | 多视角验收 | 从数据集声明或目录提取相机集合，逐 Episode 检查轨迹与视频对应关系 |
-| 格式转换与交付 | 在已验收批次上生成 LeRobot v2.1、MCAP、Zarr v2 产物，提供 ZIP、Manifest 与标注 JSONL |
+| 格式转换与交付 | 在已验收批次上生成 LeRobot v3.0 训练交付，并用官方 LeRobot 0.4.4 Dataset 与 DataLoader 验证；同时保留 MCAP、Zarr v2 交换格式 |
+| 大型 HDF5 遥操包 | 服务端目录导入按 Episode 聚合逐帧 HDF5，不把每帧登记成资产；支持直接映射为 LeRobot v3.0 |
 | 账号与权限 | 本地登录、角色和数据域限制、所有者控制删除授权；受保护操作由服务端鉴权 |
 
 ## 业务流程
@@ -96,14 +98,21 @@ node .\serve.js
 
 ### 2. 启用 Parquet 校验与格式转换
 
-使用 Python 3.12 建立环境，并安装转换依赖：
+使用 Python 3.12 建立转换环境，并安装转换依赖：
 
 ```powershell
 py -3.12 -m venv runtime\python
 .\runtime\python\Scripts\python.exe -m pip install -r tools\requirements-delivery.txt
 ```
 
-安装后重新启动服务。平台会查找 `runtime/python/Scripts/python.exe`；自定义 Python 路径可以通过 `LEROBOT_PYTHON` 环境变量指定。外部 Embodied Data 插件属于可选集成，不包含在本仓库中，配置见[引擎集成说明](tools/EMBODIED_INTEGRATION.md)。
+LeRobot v3.0 交付需要独立锁定环境。安装 `uv` 后执行：
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = (Join-Path $PWD 'runtime\lerobot')
+uv sync --project tools\lerobot-runtime --locked
+```
+
+该环境固定为 LeRobot 0.4.4、Torch 2.7.1 CPU、Torchvision 0.22.1、PyAV 15.1.0 和 datasets 4.1.1。安装后重新启动服务。平台会查找 `runtime/python/Scripts/python.exe` 与 `runtime/lerobot/Scripts/python.exe`；自定义路径可以分别通过 `LEROBOT_PYTHON` 和 `LEROBOT_OFFICIAL_PYTHON` 指定。外部 Embodied Data 插件属于可选集成，不包含在本仓库中，配置见[引擎集成说明](tools/EMBODIED_INTEGRATION.md)。
 
 ### 3. 导入自己的数据集
 
@@ -111,6 +120,7 @@ py -3.12 -m venv runtime\python
 
 ```text
 demo_teleoperation/
+├── annotations.jsonl
 ├── meta/
 │   ├── info.json
 │   ├── episodes.jsonl
@@ -121,19 +131,79 @@ demo_teleoperation/
     └── episode_000000.mp4
 ```
 
-目录示意不是 LeRobot 必需文件的完整清单。平台会识别分组；数据类型仍需按采集方式确认，不能仅凭文件扩展名认定 UMI、EGO 或遥操。随后执行质检、处理问题、提交任务指令审核，通过门禁后验收并交付。
+目录示意不是 LeRobot 必需文件的完整清单。平台会识别分组；数据类型仍需按采集方式确认，不能仅凭文件扩展名认定 UMI、EGO 或遥操。随后执行质检并处理问题。源数据已有标注时平台会自动解析，只有未覆盖的 Episode 才需要提交人工任务指令；全部门禁通过后验收并交付。
+
+数据包预设会根据文件扩展名、目录结构和 `meta` / `data` / `video` 分组自动选择。例如选择遥操类型并导入 `.h5` / `.hdf5` 文件时，会自动匹配“HDF5 轨迹 / 传感器数据包”；LeRobot、MCAP、Parquet、结构化数据和媒体包也各有匹配规则。自动结果会显示置信度和判断依据，用户仍可从下拉框手动切换；手动选择会保持覆盖，选择“自动识别”后恢复联动。
+
+### 大型逐帧 HDF5 目录
+
+当一条 Episode 被拆成上千个逐帧 `.hdf5` 文件时，不要使用浏览器逐文件上传。进入“数据接入 → 服务端目录导入”，填写部署电脑上的总目录，例如：
+
+```text
+E:\遥操数据\matching_cable\
+├── matching_cable\68\0.hdf5 ... 1776.hdf5
+├── matching_cable\69\0.hdf5 ... 1805.hdf5
+└── ... 74
+```
+
+平台把每个包含 HDF5 帧的目录登记为一个 Episode，源文件保留在原位置，不复制出第二份 10 GB 数据。浏览器通道检测到超过 200 个纯 HDF5 文件时会阻止逐文件登记，避免生成上万个资产和上传会话。
+
+在“Episode 浏览”中点击“生成”或“生成全部预览”，平台会从原始 HDF5 读取四路 RGB，生成 640 宽的四路 H.264 预览和首中末缩略图。生成任务使用平台唯一后台 worker，同一时间只编码一个 Episode；缓存位于 `work/previews/<资产编号>/<源指纹>/`，源文件变化后自动失效。页面默认四宫格同步播放，移动端自动切换单机位，视频接口支持 HTTP Range。
+
+`matching_cable` 预设按 `master/joint_position` → `action`、`puppet/joint_position` → `observation.state` 映射。四路 RGB 转为视频，两路深度图执行可解码校验；跨帧时间戳、NaN/Inf、关节维度与重复时间戳会进入质检证据。通过门禁和审核后可直接生成官方 LeRobot v3.0，不再依赖外部 Embodied Data 转换插件。
+
+### TeleUMI Session 目录
+
+TeleUMI 数据使用“数据接入 → 服务端目录导入”，选择数据类型 `UMI`。平台自动识别包含 `single_hand` 的 `session_*` 目录，每个 session 登记为一个 Episode，源文件保留在原位置。必需结构包括：
+
+```text
+session_*/
+├── Metadata/ui_backend_metadata.json
+└── single_hand/
+    ├── Metadata/{metadata,pc_metadata,pc_joint_metadata}.json
+    ├── RGB_Images/{video.mp4,timestamps.csv}
+    ├── Merged_Trajectory/{merged_trajectory.txt,vut_raw.csv}
+    └── Clamp_Data/{clamp_timebase.csv,clamp_data_tum.txt}
+```
+
+UMI 质检会核对 RGB 帧数与视频解码帧数、相机/VIVE/夹爪采样频率、时间戳单调性、跨传感器首尾同步、四元数范数、夹爪 0–100 范围和视频黑屏/冻结候选。交付时按 RGB 时间戳同步 VIVE 位姿和夹爪值，生成 `observation.state=[x,y,z,qx,qy,qz,qw,gripper]`，`action` 使用下一帧状态，并直接创建官方 LeRobot v3.0 数据集。
+
+入库所需文件组由预设决定，不再要求所有格式都包含 `meta`、`trajectory`、`media`：LeRobot v2.1 和标准三组包要求三组齐全，HDF5、MCAP、Parquet、结构化及媒体包按各自预设判断。已登记资产的全部原始文件上传完成后才开放质检。数据资产页支持勾选、全选当前筛选结果，以及按数据包或文件夹直接批量删除。
 
 > GitHub 展示源码与截图，不运行本项目的认证、上传或转换服务。`localhost` 仅指向当前电脑；让另一台电脑使用平台，需要在部署电脑运行服务并配置局域网访问。
+
+### 4. 已有标注自动导入
+
+平台会在每批文件上传完成后自动解析源文件内容，不只执行文件签名和结构质检。以下来源均可自动生成 Episode 标注并跳过人工填写：
+
+- 根目录或 `meta/` 下的 `annotations.jsonl`，每条至少包含 `episode_index` 和 `instruction`、`task_instruction` 或 `task`。
+- LeRobot 标准 `meta/episodes.jsonl`，使用 `episode_index` 与 `tasks` / `task`。
+- LeRobot 标准 `meta/tasks.jsonl`，结合 Parquet 中的 `task_index` 自动映射到各 Episode。
+
+平台会校验 JSONL 每一行、Episode 编号、任务内容和源文件 SHA-256。全部 Episode 匹配成功时，标注状态直接进入“已通过”并解除人工标注门禁；只覆盖部分 Episode 时，仅未覆盖记录进入人工队列。解析失败会绑定源文件证据并阻断相关批次，不会伪造通过结果。
+
+同一数据集允许不同 Episode 使用不同指令。LeRobot 或 MCAP/Zarr 交付时会按指令重建规范化的 `task_index`，并同步改写 LeRobot Parquet 列，避免多个指令共用同一个任务索引造成交付冲突。
+
+### 数据质检范围
+
+文件存在、SHA-256、签名和容器结构属于基础完整性检查，不等同于数据质量通过。当前服务端额外执行：
+
+- LeRobot Parquet 必需列、向量维度、NaN/Inf、时间戳与帧号连续性、Episode 混写和 FPS 采样间隔检查。
+- 视频逐帧解码、分辨率、时间戳、黑屏/冻结候选，以及视频时长与轨迹行数的一致性检查。
+- 遥操 HDF5 的主从关节、末端位姿、力通道、时间戳、4 路 RGB JPEG、2 路深度 PNG 和跨文件时序缺口检查；`puppet/6f` 在 `teleop-hdf5-v1` 中按可选通道处理，缺失或恒零不判为数据缺陷。
+- 同类 HDF5 文件问题按批次、采集会话和规则聚合成一个问题单，保留影响文件数，不再为每个文件重复生成相同问题。
+
+“解析器缺失”或“质检能力未覆盖”会标记为待质检阻塞，不会扣减数据分或生成数据缺陷。HDF5 未提供关节单位、相机标定等元数据时，平台会记录质检限制，不会把未验证项伪造成 100 分。
 
 ## 输出格式
 
 | 格式 | 实际产物 | 兼容范围 |
 | --- | --- | --- |
-| **LeRobot v2.1** | `meta/`、`data/`、`videos/`、审核后的指令及转换报告 | 当前基础交付布局；不声称为 LeRobot v3.0 |
+| **LeRobot v3.0** | 官方 v3.0 目录、审核后的指令、官方加载验证报告、独立验包报告 | 官方 LeRobot 0.4.4 `LeRobotDataset` 可加载，并通过首中末帧解码与 DataLoader 冒烟 |
 | **MCAP** | 每 Episode 一个 `.mcap`，写入原时间戳的 JSON 轨迹消息；视频随 ZIP 独立保留并由相对路径关联 | `embodied-json` profile；不是 ROS/ROS2 bag，不包含解码图像话题 |
 | **Zarr v2** | 每 Episode 一个 group；数值列为数组，其余列为带编码说明的 JSON 字符串；视频随包保留 | 本项目的列数组布局，接入训练框架时需核对字段与布局 |
 
-当前 MCAP / Zarr 转换源限定为**已物化的 LeRobot v2.x**。转换逐 Episode 回读全部列值和时间戳，验证视频字节哈希与 ZIP CRC，并记录整包 SHA-256。它验证产物一致性，不代替完整视频解码、人工审核或训练框架验收。
+LeRobot v2.1 源包会物化为官方 v3.0；逐帧 HDF5 和 UMI Session 使用各自原生适配器直接创建官方 LeRobot v3.0。所有 LeRobot 交付只有在官方 LeRobot 0.4.4 Dataset 加载、视频帧解码、DataLoader batch 冒烟和独立解包验包全部通过后才可下载。MCAP / Zarr 从 LeRobot v2.1 工作目录生成，并通过全列回读、视频解码、ZIP CRC 和整包 SHA-256 校验；它们不是机器人策略训练格式的兼容性承诺。
 
 同一批次的一份交付记录可以附加多种格式。源文件、任务指令或验收状态改变后，服务端阻止下载失效的转换包；源文件与基础快照不一致时，需要重新建立有效的交付版本。
 
@@ -143,19 +213,29 @@ demo_teleoperation/
 | --- | --- |
 | 指令保存、提交、审核、退回及角色约束 | [标注接口测试](tests/annotation-api.test.js)、[标注业务测试](tests/annotation-workflow.test.js) |
 | Episode 多视角、审核与验收门禁 | [工作流门禁测试](tests/workflow-gates.test.js)、[工作流接口测试](tests/workflow-api.test.js) |
-| 三种格式生成、下载、重复复用、权限与旧包失效 | [交付接口测试](tests/delivery-api.test.js) |
-| 全列值与时间戳回读、视频字节保留、缺视角 / 时间戳倒序拒绝 | [转换器测试](tests/test_delivery_convert.py) |
+| 三种格式生成、官方 LeRobot v3.0 验证、下载、重复复用、权限与旧包失效 | [交付接口测试](tests/delivery-api.test.js) |
+| 官方加载、DataLoader、轨迹回读、缺视角 / 时间戳倒序拒绝 | [转换器测试](tests/test_delivery_convert.py)、[官方验证器](tools/official_lerobot.py) |
+| TeleUMI Session 聚合、时序质检、标注验收与 LeRobot v3.0 交付 | [UMI 导入测试](tests/umi-session-import.test.js)、[UMI 交付测试](tests/umi-session-delivery.test.js)、[UMI 转换器测试](tests/test_umi_convert.py) |
 
-2026-11-04 本地复核结果：**20 项 Node 测试 + 3 项 Python 测试通过**。测试使用合成数据；其中媒体是用于字节保真验证的占位内容，不证明真实视频能播放，也不代表任意机器人数据集均已验收。
+2026-11-15 本地复核结果：**56 项 Node 测试 + 15 项 Python 测试通过**，官方 LeRobot 0.4.4 环境中的 UMI→v3.0 和 HDF5 四路预览测试通过；另用真实 5 条 UMI 数据完成 5 个 Episode、6,939 帧转换和独立 ZIP 验包。测试与结构验证不代表具体训练效果已经验收。
 
 ```powershell
 node --check serve.js
 node --check assets\extensions.js
 node --test tests/*.test.js
 .\runtime\python\Scripts\python.exe -m unittest discover -s tests -p test_delivery_convert.py -v
+.\runtime\python\Scripts\python.exe -m unittest discover -s tests -p test_production_check.py -v
 ```
 
 ## 数据存储与部署范围
+
+### 大文件传输
+
+浏览器导入默认并发上传 3 个文件，单个文件默认使用 16 MiB 分片。活动上传的偏移和分片摘要写入独立会话清单，分片写入不再逐次同步整份上传集合；服务重启后可从最后一次清单检查点继续。完成时会完整核对分片、生成整文件 SHA-256，并直接接管临时文件，不再复制一遍原文件。
+
+局域网部署可在启动服务前设置 `UPLOAD_CHUNK_SIZE_MB` 调整分片，允许范围为 1 到 64 MiB，例如 `$env:UPLOAD_CHUNK_SIZE_MB = 16`。数据包 ZIP 下载支持 HTTP Range，可断点续传；下载前不再同步扫描整个 ZIP 计算哈希，而是使用转换阶段登记的整包 SHA-256、大小和 ETag。
+
+任务中心统一显示上传、质检、转换、交付、备份和复检任务。上传任务可按文件暂停、继续和删除；暂停在当前分片完成后停止发送，继续时从服务端已确认偏移恢复，删除会清理未完成分片。运行中的质检或转换属于不可安全挂起的进程，平台只允许暂停排队任务和删除未运行任务。
 
 - 原始文件、认证状态、质检记录和交付包保存在部署电脑的 `work/` 中；`work/`、`runtime/`、日志和缓存已加入 Git 忽略规则。
 - ZIP 与资产下载经过服务端认证和权限检查，`work/` 与 `.git/` 不作为静态文件公开。
@@ -183,4 +263,4 @@ node --test tests/*.test.js
 
 ## 参考与致谢
 
-仓库首页借鉴 [Embodied-AI-Data-Processing-Platform](https://github.com/MAHONGHAO1/Embodied-AI-Data-Processing-Platform) 的“业务流程 + 内嵌截图 + 验证证据 + 启动说明”组织方式。截图与实现来自本项目；该项目的官方 LeRobot v3.0 转换或其他验证结论不作为本平台的能力证明。
+仓库首页借鉴 [Embodied-AI-Data-Processing-Platform](https://github.com/MAHONGHAO1/Embodied-AI-Data-Processing-Platform) 的“业务流程 + 内嵌截图 + 验证证据 + 启动说明”组织方式。截图与实现来自本项目；LeRobot v3.0 能力由本仓库固定的官方 0.4.4 运行时、验证报告和本地回归测试证明。

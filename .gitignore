@@ -3,6 +3,7 @@ work/
 work-*/
 runtime/
 .codex/
+.cache/
 node_modules/
 __pycache__/
 *.pyc

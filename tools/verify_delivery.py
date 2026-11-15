@@ -14,6 +14,18 @@ def sha256(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def dataset_fingerprint(root):
+    result = hashlib.sha256()
+    for folder in ('meta', 'data', 'videos'):
+        for file in sorted((root / folder).rglob('*')):
+            if not file.is_file():
+                continue
+            relative = file.relative_to(root).as_posix()
+            result.update(relative.encode('utf-8') + b'\0')
+            result.update(sha256(file).encode('ascii') + b'\0')
+    return result.hexdigest()
+
+
 def verify(archive, target):
     import av
     archive = Path(archive)
@@ -54,8 +66,61 @@ def verify(archive, target):
             video_count += 1
             video_frames += frames
             media_by_episode.setdefault(file.stem, {})[file.parent.name] = frames
-        rows_total = episodes = 0
         required = {'timestamp', 'episode_index', 'frame_index', 'task_index', 'action', 'observation.state'}
+        version = str(info.get('codebase_version', ''))
+        if target == 'lerobot' and version == 'v3.0':
+            import pyarrow.parquet as pq
+            official_path = root / 'official-lerobot-verification.json'
+            if not official_path.is_file():
+                raise ValueError('LeRobot v3.0 交付缺少官方加载验证报告')
+            official = json.loads(official_path.read_text(encoding='utf-8'))
+            if official.get('status') != 'passed' or official.get('offline') is not True or official.get('video_backend') != 'pyav':
+                raise ValueError('LeRobot v3.0 官方加载验证未通过')
+            fingerprint = dataset_fingerprint(root)
+            if official.get('dataset_fingerprint') != fingerprint:
+                raise ValueError('交付包数据集指纹与官方验证记录不一致')
+            episode_files = sorted((root / 'meta' / 'episodes').rglob('*.parquet'))
+            if not episode_files:
+                raise ValueError('LeRobot v3.0 缺少 meta/episodes 数据')
+            episode_rows = []
+            for file in episode_files:
+                episode_rows.extend(pq.read_table(file).to_pylist())
+            episode_rows.sort(key=lambda row: int(row['episode_index']))
+            if [int(row['episode_index']) for row in episode_rows] != list(range(len(episode_rows))):
+                raise ValueError('LeRobot v3.0 Episode 索引不连续')
+            data_files = sorted((root / 'data').rglob('*.parquet'))
+            rows_by_episode = {}
+            rows_total = 0
+            for file in data_files:
+                rows = pq.read_table(file).to_pylist()
+                if not rows or not all(required <= row.keys() for row in rows):
+                    raise ValueError('轨迹为空或缺少必需列')
+                for row in rows:
+                    episode = int(row['episode_index'])
+                    rows_by_episode.setdefault(episode, []).append(row)
+                rows_total += len(rows)
+            if set(rows_by_episode) != set(range(len(episode_rows))):
+                raise ValueError('轨迹 Episode 与 v3.0 元数据不一致')
+            for episode, rows in rows_by_episode.items():
+                expected = int(episode_rows[episode]['dataset_to_index']) - int(episode_rows[episode]['dataset_from_index'])
+                if len(rows) != expected:
+                    raise ValueError(f'Episode {episode} 帧数与 v3.0 元数据不一致')
+                timestamps = [row['timestamp'] for row in rows]
+                if any(not isinstance(t, (int, float)) or not math.isfinite(t) or t < 0 for t in timestamps) or any(b <= a for a, b in zip(timestamps, timestamps[1:])):
+                    raise ValueError(f'Episode {episode} 时间戳无效')
+                for row in rows:
+                    for field in ('action', 'observation.state'):
+                        values = row[field]
+                        if not isinstance(values, list) or not values or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in values):
+                            raise ValueError(f'Episode {episode} 轨迹向量无效：{field}')
+            declared = {key for key, feature in info.get('features', {}).items() if feature.get('dtype') == 'video'}
+            present = {file.relative_to(root / 'videos').parts[0] for file in (root / 'videos').rglob('*.mp4')}
+            if declared - present:
+                raise ValueError('LeRobot v3.0 缺少声明的视频视角')
+            if official.get('episode_count') != len(episode_rows) or official.get('frame_count') != rows_total:
+                raise ValueError('官方验证记录中的 Episode 或帧数不一致')
+            return {'ok': True, 'engine': 'independent-package-reader-v2', 'format': target, 'formatVersion': version, 'episodes': len(episode_rows), 'frames': rows_total, 'videos': video_count, 'decodedVideoFrames': video_frames, 'inventoryFiles': len(listed), 'archiveSha256': sha256(archive), 'datasetFingerprint': fingerprint, 'officialVerification': 'passed', 'officialLerobotVersion': official.get('official_lerobot_version'), 'checks': ['zip-crc', 'inventory-sha256', 'v3-episode-metadata', 'v3-data-layout', 'full-video-decode', 'trajectory-reader', 'timestamp-order', 'finite-vectors', 'dataset-fingerprint', 'official-lerobot-report'], 'downstreamTrainingLoader': 'official LeRobot Dataset + DataLoader verified before packaging', 'compatibility': '官方 0.4.4 加载与 batch 冒烟通过；机器人字段语义和训练效果仍需业务验收。'}
+        rows_total = episodes = 0
         for file in sorted(root.glob('**/*.parquet') if target == 'lerobot' else root.glob('*.mcap') if target == 'mcap' else root.glob('*.zarr')):
             if target == 'lerobot':
                 import pyarrow.parquet as pq

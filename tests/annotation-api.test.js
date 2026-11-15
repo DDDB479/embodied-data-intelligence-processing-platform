@@ -167,8 +167,11 @@ test('annotation HTTP API enforces draft, submit and review transitions', async 
     assert.equal(fs.readdirSync(path.join(exported.body.job.lerobotDirectory, 'videos', 'chunk-000'), { recursive: true }).filter(name => String(name).endsWith('.mp4')).length, 4);
     const manifestFile = fs.readdirSync(path.join(dir, 'exports')).find(name => name.startsWith(exported.body.job.id) && name.endsWith('.json'));
     const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'exports', manifestFile), 'utf8'));
-    assert.equal(manifest.schemaVersion, '1.3');
-    assert.equal(manifest.targetFormat, 'LeRobot v2.1');
+    assert.equal(manifest.schemaVersion, '1.4');
+    assert.equal(manifest.targetFormat, 'LeRobot v3.0');
+    assert.equal(manifest.lerobot.sourceVersion, 'v2.1');
+    assert.equal(manifest.lerobot.targetVersion, 'v3.0');
+    assert.equal(manifest.lerobot.trainingReady, false);
     assert.equal(manifest.lerobot.validation.ok, true);
     assert.equal(manifest.episodeCount, 1);
     assert.equal(manifest.fileCount, 6);

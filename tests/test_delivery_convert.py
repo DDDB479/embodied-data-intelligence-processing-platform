@@ -57,9 +57,19 @@ class DeliveryConversionTests(unittest.TestCase):
                     self.assertEqual(result['archiveSha256'], converter.digest(Path(result['archive'])))
                     with zipfile.ZipFile(result['archive']) as archive:
                         self.assertIsNone(archive.testzip())
-                        self.assertEqual(json.loads(archive.read('meta/tasks.jsonl'))['task'], 'approved task')
-                        for media in result['media']:
-                            self.assertEqual(archive.read(media['path']), (source / media['path']).read_bytes())
+                        if target == 'lerobot':
+                            info = json.loads(archive.read('meta/info.json'))
+                            self.assertEqual(info['codebase_version'], 'v3.0')
+                            self.assertIn('meta/tasks.parquet', archive.namelist())
+                            self.assertIn('official-lerobot-verification.json', archive.namelist())
+                            self.assertNotIn('meta/tasks.jsonl', archive.namelist())
+                            verification = json.loads(archive.read('official-lerobot-verification.json'))
+                            self.assertEqual(verification['status'], 'passed')
+                            self.assertEqual(verification['official_lerobot_version'], '0.4.4')
+                        else:
+                            self.assertEqual(json.loads(archive.read('meta/tasks.jsonl'))['task'], 'approved task')
+                            for media in result['media']:
+                                self.assertEqual(archive.read(media['path']), (source / media['path']).read_bytes())
                     if target == 'mcap':
                         from mcap.reader import make_reader
                         with (output / 'episode_000000.mcap').open('rb') as stream:
@@ -84,6 +94,28 @@ class DeliveryConversionTests(unittest.TestCase):
                 converter.convert(source, root / 'mcap', 'mcap', annotations)
             self.assertFalse((root / 'mcap').exists())
             self.assertFalse((root / 'mcap.zip').exists())
+
+    def test_different_episode_instructions_are_normalized_to_distinct_task_indices(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, annotations = fixture(root)
+            annotations.write_text(
+                json.dumps({'episode_index': 0, 'instruction': 'insert red connector'}) + '\n'
+                + json.dumps({'episode_index': 1, 'instruction': 'place blue connector in tray'}) + '\n',
+                encoding='utf-8',
+            )
+            result = converter.convert(source, root / 'lerobot', 'lerobot', annotations)
+            self.assertTrue(result['ok'])
+            task_table = pq.read_table(root / 'lerobot' / 'meta' / 'tasks.parquet')
+            task_values = task_table['task'].to_pylist() if 'task' in task_table.column_names else task_table[task_table.column_names[-1]].to_pylist()
+            self.assertEqual(sorted(task_values), sorted(['insert red connector', 'place blue connector in tray']))
+            annotations = [json.loads(line) for line in (root / 'lerobot' / 'annotations.jsonl').read_text(encoding='utf-8').splitlines()]
+            self.assertEqual({row['episode_index']: row['instruction'] for row in annotations}, {0: 'insert red connector', 1: 'place blue connector in tray'})
+            episode_tasks = {}
+            for parquet_file in (root / 'lerobot' / 'data').rglob('*.parquet'):
+                for row in pq.read_table(parquet_file, columns=['episode_index', 'task_index']).to_pylist():
+                    episode_tasks.setdefault(row['episode_index'], set()).add(row['task_index'])
+            self.assertEqual(episode_tasks, {0: {0}, 1: {1}})
 
     def test_timestamp_reversal_is_rejected(self):
         with tempfile.TemporaryDirectory() as folder:

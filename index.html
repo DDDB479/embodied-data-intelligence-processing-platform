@@ -22,7 +22,7 @@
     @media(max-width:1120px){.sidebar{width:205px;flex-basis:205px}.content{padding:22px}.topbar{padding:0 22px}.layout-top,.layout-bottom{grid-template-columns:1fr}.module-grid{grid-template-columns:1fr}.process-entry-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.process-entry:nth-child(4n){border-right:1px solid var(--line)}.process-entry:nth-child(2n){border-right:0}}
     @media(max-width:760px){.sidebar{width:64px;flex-basis:64px;padding:15px 8px}.brand{padding:0 6px 22px}.brand div:not(.brand-mark),.nav-title,.nav button span,.side-foot{display:none}.nav button{justify-content:center;padding:12px}.content{padding:18px 13px 30px}.topbar{padding:0 14px}.crumb span{display:none}.user div:not(.avatar){display:none}.page-head{display:block}.actions{margin-top:14px;flex-wrap:wrap}.kpis{grid-template-columns:repeat(2,1fr);gap:10px}.kpi{padding:13px}.kpi-value{font-size:22px}.table-toolbar{flex-wrap:wrap}.search{max-width:none;flex-basis:100%}.process-entry-grid{grid-template-columns:1fr}.process-entry{border-right:0}.process-entry:nth-child(2n){border-right:0}}
   </style>
-  <link rel="stylesheet" href="assets/extensions.css?v=20261109-v35" />
+  <link rel="stylesheet" href="assets/extensions.css?v=20261115-v37" />
 </head>
 <body>
   <div class="app">
@@ -162,6 +162,7 @@
       const task={id:'TASK-'+Date.now(),name,type,scene,targetCount,acceptanceScore,description,createdAt:new Date().toISOString()};const serverTask=globalThis.platformPersistTask?await globalThis.platformPersistTask(task):null;if(serverTask?.task)writeStore(storageKey.tasks,[...readStore(storageKey.tasks),serverTask.task]);modal.classList.remove('show');showToast('采集任务已创建：'+name+(serverTask?'（已写入服务端）':''));if(currentPage==='tasks')showPage('tasks');
     };
   </script>
-      <script src="assets/extensions.js?v=20261109-v63"></script>
+      <script src="assets/import-detection.js?v=20261113-v1"></script>
+      <script src="assets/extensions.js?v=20261115-v70"></script>
 </body>
 </html>

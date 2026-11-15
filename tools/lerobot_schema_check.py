@@ -59,6 +59,7 @@ def check_file(path, features=None, fps=None):
     readable = [name for name in REQUIRED if name in fields]
     table = parquet.read(columns=readable) if readable else None
     vector_lengths = {}
+    task_indices = []
     numeric_invalid = 0
     monotonic_failures = {}
     if table is not None:
@@ -93,6 +94,10 @@ def check_file(path, features=None, fps=None):
             if name not in table.column_names:
                 continue
             values = [scalar(value) for value in table[name].to_pylist()]
+            if name == "task_index":
+                task_indices = sorted({int(value) for value in values
+                                       if isinstance(value, (int, float)) and not isinstance(value, bool)
+                                       and math.isfinite(float(value)) and value >= 0 and int(value) == value})
             valid = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)) and v >= 0
             for row, value in enumerate(values):
                 if not valid(value) or (name != "timestamp" and int(value) != value):
@@ -133,6 +138,7 @@ def check_file(path, features=None, fps=None):
         "fields": fields,
         "missing": missing,
         "vectorLengths": vector_lengths,
+        "taskIndices": task_indices,
         "monotonicFailures": monotonic_failures,
         "issues": issues,
         "findings": findings[:100],

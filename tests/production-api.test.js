@@ -63,9 +63,26 @@ test('real import, restart resume, missing-video repair, annotation, acceptance 
     const duplicateExit = await new Promise(resolve => { const timer = setTimeout(() => { duplicateService.kill(); resolve(null); }, 5000); duplicateService.once('exit', code => { clearTimeout(timer); resolve(code); }); });
     assert.equal(duplicateExit, 1, 'a second server must not take over the same database queue');
     const setup = await call('/api/auth/setup', { name: 'Producer', email: 'producer@example.invalid', password: 'TestPass12345' }); assert.equal(setup.status, 201); cookie = setup.headers.get('set-cookie').split(';')[0];
+    for (const [id, relativePath] of [['DEL-LEFT', 'delete-fixture/left/one.jsonl'], ['DEL-RIGHT', 'delete-fixture/right/two.jsonl']]) {
+      const created = await call('/api/assets', { id, name: path.basename(relativePath), bundleId: 'B-DELETE', bundleName: 'delete fixture', relativePath, bundleRole: 'meta', type: '遥操' });
+      assert.equal(created.status, 201, JSON.stringify(created.data));
+    }
+    const folderDelete = await call('/api/assets/bulk-delete', { bundleId: 'B-DELETE', folder: 'delete-fixture/left' });
+    assert.equal(folderDelete.status, 200, JSON.stringify(folderDelete.data));
+    assert.deepEqual(folderDelete.data.removed, ['DEL-LEFT']);
+    const bundleDelete = await call('/api/assets/bulk-delete', { bundleId: 'B-DELETE' });
+    assert.equal(bundleDelete.status, 200, JSON.stringify(bundleDelete.data));
+    assert.deepEqual(bundleDelete.data.removed, ['DEL-RIGHT']);
     const source = path.join(directory, 'source'), missing = 'videos/chunk-000/observation.images.head/episode_000001.mp4';
+    fs.writeFileSync(path.join(source, 'annotations.jsonl'), [
+      JSON.stringify({ episode_index: 0, instruction: '插入红色连接器' }),
+      JSON.stringify({ episode_index: 1, instruction: '把蓝色连接器放入料盒' }),
+    ].join('\n') + '\n');
     const files = fs.readdirSync(source, { recursive: true }).filter(name => fs.statSync(path.join(source, name)).isFile()).map(name => name.replaceAll('\\', '/'));
     for (const relative of files.filter(name => name !== missing)) await upload(relative, fs.readFileSync(path.join(source, relative)), ids.length === 0);
+    const analyzed = await call('/api/imports/analyze', { bundleId: 'B-PRODUCTION' });
+    assert.equal(analyzed.status, 200, JSON.stringify(analyzed.data));
+    assert.equal(analyzed.data.imported, 2, JSON.stringify(analyzed.data));
     await job('quality', { scope: '全部数据', targetIds: ids });
     let state = (await call('/api/state', null, 'GET')).data;
     const missingIssues = state.issues.filter(issue => issue.status !== '已关闭');
@@ -81,13 +98,16 @@ test('real import, restart resume, missing-video repair, annotation, acceptance 
     assert.equal(state.issues.filter(issue => issue.status !== '已关闭').length, 0, JSON.stringify(state.issues));
     assert.ok(missingIssues.every(issue => state.issues.find(item => item.id === issue.id)?.verification?.verified));
     assert.ok(state.assets.every(asset => asset.status === '已通过'), JSON.stringify(state.qcBatches[0].results));
-    assert.equal((await call('/api/annotations/generate', {})).status, 201);
-    const submit = await call('/api/annotations/standard', { groupKey: 'B-PRODUCTION', instruction: '插接连接器', action: 'submit' }); assert.equal(submit.status, 200, JSON.stringify(submit.data));
-    assert.notEqual((await call('/api/bundles/status', { id: 'B-PRODUCTION', status: '待验收' })).status, 200, 'unreviewed annotations cannot pass');
+    const generated = await call('/api/annotations/generate', {});
+    assert.equal(generated.status, 201);
+    assert.equal(generated.data.created, 0, 'metadata tasks must auto-fill instead of creating manual work');
+    assert.ok(generated.data.annotations.length >= 2, JSON.stringify(generated.data.annotations));
+    assert.ok(generated.data.annotations.every(annotation => annotation.status === '已通过' && annotation.autoImported === true && annotation.instruction), JSON.stringify(generated.data.annotations));
+    assert.deepEqual(new Set(generated.data.annotations.map(annotation => annotation.instruction)), new Set(['插入红色连接器', '把蓝色连接器放入料盒']));
+    assert.equal(generated.data.annotationGroups.find(group => group.key === 'B-PRODUCTION')?.status, '已通过');
     const member = await call('/api/members', { name: 'Reviewer', email: 'reviewer@example.invalid', role: '标注审核员', domain: '遥操', password: 'ReviewPass12345' }); assert.equal(member.status, 201);
     const ownerCookie = cookie;
     const login = await call('/api/auth/login', { email: 'reviewer@example.invalid', password: 'ReviewPass12345' }); cookie = login.headers.get('set-cookie').split(';')[0];
-    const approved = await call('/api/annotations/standard', { groupKey: 'B-PRODUCTION', action: 'approve' }); assert.equal(approved.status, 200, JSON.stringify(approved.data));
     assert.equal((await call('/api/jobs', { kind: 'backup', payload: {} })).status, 403);
     cookie = ownerCookie;
     for (const status of ['待验收', '已验收']) { const response = await call('/api/bundles/status', { id: 'B-PRODUCTION', status }); assert.equal(response.status, 200, JSON.stringify(response.data)); }

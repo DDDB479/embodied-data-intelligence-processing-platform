@@ -27,10 +27,10 @@ test('V6 converts one accepted batch to three verified downloadable formats', { 
     const listener = net.createServer(); await new Promise(resolve => listener.listen(0, '127.0.0.1', resolve));
     const port = listener.address().port; await new Promise(resolve => listener.close(resolve));
     child = spawn(process.execPath, [path.join(root, 'serve.js')], { cwd: root, env: { ...process.env, HOST: '127.0.0.1', PORT: String(port), DATA_WORK_DIR: dir, LEROBOT_PYTHON: python }, stdio: 'ignore', windowsHide: true });
-    function request(method, route, body, cookie = '') {
+    function request(method, route, body, cookie = '', extraHeaders = {}) {
       return new Promise((resolve, reject) => {
         const payload = body ? JSON.stringify(body) : '';
-        const req = http.request({ hostname: '127.0.0.1', port, path: route, method, headers: { Cookie: cookie, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, res => {
+        const req = http.request({ hostname: '127.0.0.1', port, path: route, method, headers: { Cookie: cookie, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), ...extraHeaders } }, res => {
           const chunks = []; res.on('data', chunk => chunks.push(chunk)); res.on('end', () => { const buffer = Buffer.concat(chunks); resolve({ status: res.statusCode, headers: res.headers, body: String(res.headers['content-type']).includes('application/json') ? JSON.parse(buffer) : buffer }); });
         }); req.on('error', reject); req.end(payload);
       });
@@ -43,6 +43,9 @@ test('V6 converts one accepted batch to three verified downloadable formats', { 
     const created = await request('POST', '/api/exports', { name: 'Delivery', bundleId: 'B-DELIVERY' }, cookie);
     assert.equal(created.status, 201, JSON.stringify(created.body));
     const id = created.body.job.id;
+    assert.equal(created.body.job.format, 'LeRobot v3.0');
+    assert.equal(created.body.job.baseFormat, 'LeRobot v2.1');
+    assert.equal(created.body.job.trainingReady, false);
     assert.equal((await request('POST', '/api/exports/convert', { id, format: 'mcap' })).status, 401);
     assert.equal((await request('POST', '/api/exports/convert', { id, format: 'mcp' }, cookie)).status, 400);
     for (const format of ['mcap', 'zarr', 'lerobot']) {
@@ -50,10 +53,24 @@ test('V6 converts one accepted batch to three verified downloadable formats', { 
       assert.equal(converted.status, 201, JSON.stringify(converted.body));
       const output = converted.body.job.conversions[format];
       assert.equal(output.ok, true); assert.equal(output.frames, 6); assert.equal(output.episodes, 2);
+      if (format === 'lerobot') {
+        assert.equal(output.formatVersion, 'v3.0');
+        assert.equal(output.officialVerification.status, 'passed');
+        assert.equal(output.officialVerification.officialLerobotVersion, '0.4.4');
+        assert.equal(output.independentVerification.officialVerification, 'passed');
+        assert.equal(output.independentVerification.officialLerobotVersion, '0.4.4');
+        assert.equal(output.independentVerification.formatVersion, 'v3.0');
+      }
       assert.equal(converted.body.exports.length, 1);
       const download = await request('GET', `/api/exports/${id}/package?format=${format}`, null, cookie);
       assert.equal(download.status, 200);
       assert.equal(crypto.createHash('sha256').update(download.body).digest('hex'), output.archiveSha256);
+      const partial = await request('GET', `/api/exports/${id}/package?format=${format}`, null, cookie, { Range: 'bytes=0-31' });
+      assert.equal(partial.status, 206);
+      assert.equal(partial.headers['accept-ranges'], 'bytes');
+      assert.equal(partial.headers['content-range'], `bytes 0-31/${output.archiveBytes}`);
+      assert.equal(partial.headers.etag, `"${output.archiveSha256}"`);
+      assert.deepEqual(partial.body, download.body.subarray(0, 32));
       const duplicate = await request('POST', '/api/exports/convert', { id, format }, cookie);
       assert.equal(duplicate.status, 200); assert.equal(duplicate.body.duplicate, true);
     }
