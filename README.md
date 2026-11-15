@@ -6,26 +6,30 @@
 
 **Windows 本地 / 局域网运行 · Node.js 服务端 · Python 数据转换 · V6 流程模板**
 
-[界面预览](#界面预览) · [业务流程](#业务流程) · [快速开始](#快速开始) · [输出格式](#输出格式) · [测试与证据](#测试与证据) · [操作说明](docs/OPERATIONS.md)
+**GitHub 稳定快照：`v3.6.3` · 2026-11-15 · 支持从 `1fb00bd` 快进升级**
 
-[![平台质量总览：检测结果与待处理问题](docs/screenshots/00-overview.jpg)](docs/screenshots/00-overview.jpg)
+[界面预览](#界面预览) · [本轮升级](#本轮升级) · [业务流程](#业务流程) · [快速开始](#快速开始) · [输出格式](#输出格式) · [升级旧版本](docs/UPGRADE.md) · [测试与证据](#测试与证据)
 
-> 截图拍摄于 **2026-11-04**，来自本项目实际运行的界面，使用隔离的合成测试样本与测试账号。截图中的业务状态不代表真实采集数据验收；质检与交付专项展示的来源和范围见[截图说明](docs/SCREENSHOTS.md)。仓库不包含生产数据、业务账号或运行时目录。
+[![平台质量总览：UMI、EGO 与遥操数据统一工作台](docs/screenshots/10-overview-current.png)](docs/screenshots/10-overview-current.png)
+
+> 截图拍摄于 **2026-11-15**，来自当前版本实际运行界面。业务名称、账号、资产编号和视频画面已替换、隐藏或做隐私处理；仓库不包含生产数据、账号密码、`work/` 或 `runtime/`。
 
 ## 项目能做什么
 
 | 工作环节 | 当前实现 |
 | --- | --- |
-| 文件夹接入 | 选择数据集总目录，按路径识别 `meta`、`data`、`video/videos`；人工确认 UMI、EGO 或遥操类型 |
+| 文件夹接入 | 浏览器上传与服务端目录导入；自动识别 UMI Session、逐帧 HDF5、LeRobot、MCAP、Parquet 和三组数据包 |
 | 批次工作台 | 聚合文件完整性、质检、问题、审核和验收门禁，并展示 V6 节点可用状态 |
 | 质量检测 | 服务端规则检查、质检批次、问题证据；LeRobot / Parquet 深度检查需要 Python 环境 |
 | 问题处理 | 按资产定位检测项，分配处置、填写说明、执行复检；保留问题状态与处理记录 |
 | 标注与审核 | 自动解析 `annotations.jsonl`、LeRobot `episodes.jsonl` / `tasks.jsonl` 并按 Episode 继承；未覆盖范围才进入“选择范围 → 统一标准 → 批量送审 → 异常处理/审核” |
 | 任务中心 | 按生产任务或数据包展示上传、清洗、质检、标注、转换全流程进度，同时保留后台执行任务、业务待办、失败重试和执行日志 |
-| Episode 预览 | HDF5 逐帧 Episode 按需生成四路同步 H.264 预览、首中末缩略图和可清理缓存 |
+| Episode 预览 | HDF5 四路同步预览；UMI 将浏览器不兼容的 `mpeg4` 按需转码为 H.264 单机位预览 |
 | 多视角验收 | 从数据集声明或目录提取相机集合，逐 Episode 检查轨迹与视频对应关系 |
 | 格式转换与交付 | 在已验收批次上生成 LeRobot v3.0 训练交付，并用官方 LeRobot 0.4.4 Dataset 与 DataLoader 验证；同时保留 MCAP、Zarr v2 交换格式 |
 | 大型 HDF5 遥操包 | 服务端目录导入按 Episode 聚合逐帧 HDF5，不把每帧登记成资产；支持直接映射为 LeRobot v3.0 |
+| TeleUMI Session | 每个 `session_*` 聚合成一个 Episode，检查 RGB/VIVE/夹爪频率、时间戳、同步、四元数和夹爪范围 |
+| 高速小文件传输 | 批量创建上传任务、轻量分片请求、1,000 文件批量校验入库；登记上限 20,000 个资产 |
 | 账号与权限 | 本地登录、角色和数据域限制、所有者控制删除授权；受保护操作由服务端鉴权 |
 
 ## 业务流程
@@ -50,35 +54,49 @@ flowchart LR
 
 平台使用 **V6 模板**展示后续扩展路径。融合、脱敏、去畸变、位姿、语义等尚未接入的节点显示为“未接入”；当前已实现的业务路径与完整 V6 算法流水线应分别看待。V5 与配音分支不纳入新流程。
 
+## 本轮升级
+
+从上一发布快照 `1fb00bd` 到当前稳定快照，主要变化如下：
+
+- **统一导航**：日常入口收敛为“批次总览、数据浏览、运行诊断、交付核验、系统管理”，旧页面保留为工作区二级标签。
+- **TeleUMI 接入**：服务端目录导入自动把 `session_*` 聚合为 Episode，保留源文件位置和清单指纹；重复导入返回已登记结果，不再误报只识别第一项。
+- **UMI 专用质检**：核对 RGB 视频帧数、40 FPS 时间轴、VIVE 约 120 Hz、夹爪约 60 Hz、首尾同步、四元数范数、夹爪 0–100 范围和 NaN/Inf。
+- **UMI 原生交付**：按 RGB 时间戳同步 VIVE 位姿和夹爪值，生成 8 维 `observation.state`，`action` 使用下一帧状态，直接创建官方 LeRobot v3.0。
+- **浏览器兼容预览**：源 UMI 视频编码为 `mpeg4` 时，按需转为 H.264；现有 5 条验证数据为 640×480、40 FPS，帧数与源视频一致。
+- **HDF5 交付闭环**：逐帧 HDF5 目录直接生成四路 LeRobot 视频、训练字段、官方加载报告、独立验包和 ZIP。
+- **小文件吞吐优化**：增加 6 文件并发、批量创建上传会话、轻量分片写入、1,000 文件批量完成和 gzip 响应；11,879 个元数据登记压测约 2 秒。
+- **任务中心完善**：上传、质检、标注、转换和交付进度统一展示；未完成上传支持暂停、继续和删除。
+- **数据兼容保留**：旧 SQLite 数据原位迁移；`work/`、`runtime/` 不参与源码更新；升级前可自动创建数据库备份。
+
 ## 界面预览
 
-图片直接内嵌在 GitHub 首页；**点击任意截图查看原图**。页面数据均为隔离测试样本，未使用业务数据截图。
+图片直接内嵌在 GitHub 首页；**点击任意截图查看原图**。页面来自当前版本真实浏览器运行结果，账号、业务名称、资产编号和视频画面已清洗。
 
-| ① 数据接入 | ② 生产批次 · V6 |
+| ① 批次总览 | ② 数据接入 |
 | --- | --- |
-| [![数据接入：按批次查看目录分组和入库规模](docs/screenshots/01-intake.jpg)](docs/screenshots/01-intake.jpg) | [![生产批次：V6 节点状态和当前门禁](docs/screenshots/02-production-preview.jpg)](docs/screenshots/02-production.jpg) |
-| 总文件夹导入入口、文件分组、Episode 数量与入库状态。 | 当前批次、问题阻断、验收入口与已接入 / 未接入节点。 |
+| [![批次总览：四个核心工作入口与质量总览](docs/screenshots/10-overview-current.png)](docs/screenshots/10-overview-current.png) | [![数据接入：UMI、HDF5 和 LeRobot 数据包统一管理](docs/screenshots/11-intake-current.png)](docs/screenshots/11-intake-current.png) |
+| 批次概览、质量健康度、待处理问题和四个核心工作入口。 | 服务端目录导入、批次聚合、入库规模和验收状态。 |
 
-| ③ 质量检测中心 | ④ 问题中心 |
+| ③ 生产批次 | ④ 标注与审核 |
 | --- | --- |
-| [![质量检测：检测范围、模板与批次记录](docs/screenshots/03-quality.jpg)](docs/screenshots/03-quality.jpg) | [![问题中心：资产、证据、等级与复检入口](docs/screenshots/04-issues.jpg)](docs/screenshots/04-issues.jpg) |
-| 对隔离样本实际执行检查，保留 0% 通过率与 6 项问题。 | 展示缺少解析证据等待处理问题，保留失败结果。 |
+| [![生产批次：导入、质检、问题、标注、验收和交付进度](docs/screenshots/12-production-current.png)](docs/screenshots/12-production-current.png) | [![标注与审核：统一标准、Episode 覆盖率和视频检查](docs/screenshots/13-annotation-current.png)](docs/screenshots/13-annotation-current.png) |
+| 当前批次门禁、文件 / Episode 数量、问题与下一步操作。 | 标注标准、5/5 Episode 覆盖、5/5 视频覆盖和待处理问题。 |
 
-| ⑤ 任务指令标注与审核 | ⑥ 规则与质量门禁 |
+| ⑤ 任务中心 | ⑥ 交付核验 |
 | --- | --- |
-| [![标注审核：任务指令审核一次并由 Episode 继承](docs/screenshots/05-annotation.jpg)](docs/screenshots/05-annotation.jpg) | [![规则中心：阈值、算子状态与规则列表](docs/screenshots/06-rules-preview.jpg)](docs/screenshots/06-rules.jpg) |
-| 同一任务指令覆盖组内 Episode；审核时只读确认或退回。 | 查看评分阈值、启用规则和当前服务端能力。 |
+| [![任务中心：全流程进度和后台任务暂停删除](docs/screenshots/15-jobs-current.png)](docs/screenshots/15-jobs-current.png) | [![交付核验：LeRobot v3.0、Manifest 和独立校验](docs/screenshots/16-delivery-current.png)](docs/screenshots/16-delivery-current.png) |
+| 上传、清洗、质检、标注、转换进度与后台执行记录。 | LeRobot v3.0、MCAP、Zarr、官方加载、独立验包和打包下载。 |
 
-| ⑦ 格式转换与交付 | ⑧ 成员与权限 |
+| ⑦ 数据浏览 | ⑧ 系统管理 |
 | --- | --- |
-| [![多格式交付：LeRobot、MCAP、Zarr 与独立 ZIP](docs/screenshots/07-delivery.jpg)](docs/screenshots/07-delivery.jpg) | [![成员权限：角色矩阵、数据域与删除授权](docs/screenshots/08-permissions.jpg)](docs/screenshots/08-permissions.jpg) |
-| 转换专项测试的三种产物、回读验证结果和下载入口。 | 隔离测试账号、角色权限矩阵与所有者删除授权入口。 |
+| [![数据浏览：UMI、遥操资产和 Episode 预览](docs/screenshots/14-assets-current.png)](docs/screenshots/14-assets-current.png) | [![系统管理：质量规则、处理算子、权限和审计](docs/screenshots/18-system-management-current.png)](docs/screenshots/18-system-management-current.png) |
+| UMI Session、遥操 HDF5 与 LeRobot 资产的筛选、质检和批量操作。 | 质量门禁、八阶段流程、规则库、成员权限与审计入口。 |
 
-### 运行证据
+### UMI 播放
 
-[![运行详情：节点执行轨迹与逐资产问题证据](docs/screenshots/09-runs.jpg)](docs/screenshots/09-runs.jpg)
+[![UMI Episode：H.264 播放控件、帧数、时长、质检和标注状态](docs/screenshots/17-umi-playback-current.png)](docs/screenshots/17-umi-playback-current.png)
 
-“运行完成”表示检查程序已执行，不等于数据全部合格。示例运行完成后仍有 6 项待处理问题；批次需继续处理，不能据此视为验收通过。
+UMI 原始采集视频使用 `mpeg4`，浏览器不能稳定播放，平台会按需转码为 H.264。截图保留播放器、时长、帧数和质检信息，真实视频画面已隐藏并替换为演示遮罩。
 
 ## 快速开始
 
@@ -95,6 +113,24 @@ node .\serve.js
 浏览器打开 [http://localhost:4173/](http://localhost:4173/)，首次启动创建自己的管理员账号。仓库没有可用于业务登录的默认账号或默认密码。
 
 日常使用可双击 `启动平台.bat`；启动器通过 `platform-service.ps1` 检查和维持本机服务。开机启动、局域网访问和故障定位见[操作说明](docs/OPERATIONS.md)。
+
+### 从旧版本升级
+
+当前稳定快照可以直接覆盖上一发布版本 `1fb00bd`，不会修改 `work/` 中的业务数据，也不会覆盖本地 `runtime/`。不熟悉命令行的用户，在仓库目录中双击 `更新平台.bat` 即可；窗口会在完成或失败后停留，方便查看结果。
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\update-platform.ps1
+```
+
+双击入口会调用同一个更新脚本：检查本地源码是否干净、备份 SQLite、快进拉取 `origin/main`、同步依赖、重启服务并等待健康检查。旧版本第一次升级时，需要先取得当前仓库中的双击入口：
+
+```powershell
+git pull --ff-only origin main
+```
+
+拉取完成后双击 `更新平台.bat`。以后有稳定更新时仍可继续使用这个入口。
+
+详细的数据保留、依赖同步、验证和回滚步骤见[升级指南](docs/UPGRADE.md)。
 
 ### 2. 启用 Parquet 校验与格式转换
 
@@ -231,7 +267,7 @@ node --test tests/*.test.js
 
 ### 大文件传输
 
-浏览器导入默认并发上传 3 个文件，单个文件默认使用 16 MiB 分片。活动上传的偏移和分片摘要写入独立会话清单，分片写入不再逐次同步整份上传集合；服务重启后可从最后一次清单检查点继续。完成时会完整核对分片、生成整文件 SHA-256，并直接接管临时文件，不再复制一遍原文件。
+浏览器导入默认并发上传 6 个文件，单个文件默认使用 16 MiB 分片。平台先批量创建上传会话，分片请求不再解析整份业务状态；完成后按 1,000 个文件批量校验和入库。服务重启后可从最后一次清单检查点继续，完成时生成整文件 SHA-256 并直接接管临时文件。
 
 局域网部署可在启动服务前设置 `UPLOAD_CHUNK_SIZE_MB` 调整分片，允许范围为 1 到 64 MiB，例如 `$env:UPLOAD_CHUNK_SIZE_MB = 16`。数据包 ZIP 下载支持 HTTP Range，可断点续传；下载前不再同步扫描整个 ZIP 计算哈希，而是使用转换阶段登记的整包 SHA-256、大小和 ETag。
 
@@ -252,12 +288,17 @@ node --test tests/*.test.js
 ├── tools/
 │   ├── delivery_convert.py         # 多格式转换与回读验证
 │   ├── lerobot_schema_check.py     # Parquet / LeRobot 字段校验
+│   ├── create-db-backup.js          # 升级前 SQLite 一致性备份
 │   └── requirements-delivery.txt   # Python 转换依赖
 ├── tests/                         # 工作流、权限与转换测试
 ├── docs/
 │   ├── screenshots/               # 当前版本实拍界面
-│   ├── SCREENSHOTS.md              # 截图来源与展示范围
+│   ├── SCREENSHOTS.md              # 截图来源与隐私处理
+│   ├── UPGRADE.md                  # 旧版本升级、验证与回滚
 │   └── OPERATIONS.md               # 操作与部署说明
+├── 更新平台.bat                    # 双击更新入口
+├── update-platform.ps1              # 备份、快进更新、依赖同步与服务重启
+├── platform-launcher.ps1            # 启动与健康检查
 └── platform-service.ps1            # Windows 服务维持脚本
 ```
 

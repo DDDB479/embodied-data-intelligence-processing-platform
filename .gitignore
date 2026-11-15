@@ -4,6 +4,7 @@ work-*/
 runtime/
 .codex/
 .cache/
+.playwright-cli/
 node_modules/
 __pycache__/
 *.pyc
