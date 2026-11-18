@@ -1,5 +1,6 @@
 """Read-only, server-side evidence checks; never rewrites source data."""
 import argparse
+import hashlib
 import io
 import json
 import math
@@ -140,23 +141,26 @@ def check_hdf5_images(hdf, group_name, names, kind, options, issues, metrics):
         metrics['depthZeroRatioMax'] = max(zero_ratios)
 
 
-def check_hdf5(path, options):
+def check_hdf5(path, options, expected_sha256=None):
     import h5py
     import numpy as np
     path = Path(path)
     issues, limitations, datasets = [], [], {}
     metrics = {'nonFiniteValues': 0, 'constantDatasets': [], 'optionalConstantDatasets': [], 'sampleCount': 0}
+    source_bytes = path.read_bytes() if expected_sha256 else None
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest() if source_bytes is not None else None
+    hash_issue = hdf5_issue('source_sha256', '源 HDF5 SHA-256 与导入清单不一致', field='sha256', actual=source_sha256, expected=expected_sha256) if expected_sha256 and source_sha256 != expected_sha256 else None
     try:
-        handle = h5py.File(path, 'r')
+        handle = h5py.File(io.BytesIO(source_bytes) if source_bytes is not None else path, 'r')
     except Exception as error:
         issue = hdf5_issue('hdf5_open', f'HDF5 无法打开：{error}')
-        return {'status': 'invalid', 'profile': HDF5_PROFILE, 'issues': [issue], 'limitations': [], 'metrics': metrics, 'datasets': {}, 'timestamps': []}
+        return {'status': 'invalid', 'profile': HDF5_PROFILE, 'issues': [issue, *([hash_issue] if hash_issue else [])], 'limitations': [], 'metrics': metrics, 'datasets': {}, 'timestamps': [], 'sourceSha256': source_sha256}
     with handle as hdf:
         known = HDF5_REQUIRED + HDF5_OPTIONAL
         present = [name for name in known if name in hdf]
         if not present:
             limitation = '未识别到遥操 HDF5 所需数据集，未执行语义质检'
-            return {'status': 'not_supported', 'profile': None, 'issues': [], 'limitations': [limitation], 'metrics': metrics, 'datasets': {}, 'timestamps': []}
+            return {'status': 'invalid' if hash_issue else 'not_supported', 'profile': None, 'issues': [hash_issue] if hash_issue else [], 'limitations': [limitation], 'metrics': metrics, 'datasets': {}, 'timestamps': [], 'sourceSha256': source_sha256}
         missing = [name for name in HDF5_REQUIRED if name not in hdf]
         if missing:
             missing_text = ', '.join(missing)
@@ -213,6 +217,8 @@ def check_hdf5(path, options):
             issues.append(hdf5_issue('constant_dataset', message, '中', field=blocking_constant))
         check_hdf5_images(hdf, 'observations/rgb_images', HDF5_RGB, 'rgb', options, issues, metrics)
         check_hdf5_images(hdf, 'observations/depth_images', HDF5_DEPTH, 'depth', options, issues, metrics)
+        if hash_issue:
+            issues.append(hash_issue)
         if not list(hdf.attrs.keys()):
             limitations.append('HDF5 未提供关节单位、相机内参/外参或时间戳单位元数据，物理量和跨模态标定仅能记录，不能最终判定')
         high = any(item['severity'] == '高' for item in issues)
@@ -225,6 +231,7 @@ def check_hdf5(path, options):
             'metrics': metrics,
             'datasets': datasets,
             'timestamps': timestamps,
+            'sourceSha256': source_sha256,
         }
 
 
@@ -242,7 +249,7 @@ def check_hdf5_sequence(members, options, asset_id=None):
     }
     failed_files = []
     for member_index, member in enumerate(members):
-        report = check_hdf5(Path(member['path']), options)
+        report = check_hdf5(Path(member['path']), options, member.get('sha256'))
         reports.append(report)
         timestamps.extend(report.get('timestamps') or [])
         metrics['sampleCount'] += int(report.get('metrics', {}).get('sampleCount', 0))
@@ -275,15 +282,23 @@ def check_hdf5_sequence(members, options, asset_id=None):
         deltas = [right - left for left, right in zip(timestamps, timestamps[1:])]
         positive = [value for value in deltas if value > 0]
         expected = (statistics.median(positive) if len(positive) >= 4 else min(positive)) if positive else None
+        cadence_tolerance = float(options.get('cadenceToleranceMs', 10))
+        cadence_deviations = [{'index': index, 'delta': value, 'deviation': abs(value - expected)} for index, value in enumerate(deltas) if value > 0 and expected and abs(value - expected) > cadence_tolerance]
         threshold = max(float(options.get('gapAbsoluteMs', 100)), expected * float(options.get('gapFactor', 2.5))) if expected else None
         gaps = [{'index': index, 'delta': value} for index, value in enumerate(deltas) if threshold and value > threshold]
+        non_increasing = [{'index': index, 'delta': value} for index, value in enumerate(deltas) if value <= 0]
         if len(set(timestamps)) != len(timestamps):
             unique_issues.insert(0, hdf5_issue('duplicate_timestamp', '采集序列存在重复时间戳', field='timestamps', actual=len(timestamps) - len(set(timestamps)), expected=0))
+        if non_increasing:
+            unique_issues.insert(0, hdf5_issue('timestamp_order', f'采集序列存在 {len(non_increasing)} 个非递增时间戳间隔', field='timestamps', actual=non_increasing[:20], expected='> 0'))
+        if cadence_deviations:
+            unique_issues.insert(0, hdf5_issue('timestamp_cadence', f'采集序列有 {len(cadence_deviations)} 个帧间隔偏离目标 {expected}ms 超过 {cadence_tolerance}ms', field='timestamps', actual=cadence_deviations[:20], expected=f'{expected}±{cadence_tolerance}ms'))
         if gaps:
             unique_issues.insert(0, hdf5_issue('timestamp_gap', f'采集序列存在 {len(gaps)} 个时间缺口，最大 {max(item["delta"] for item in gaps)} ms', '中', field='timestamps', actual=len(gaps), expected=0))
         sequence = {
             'fileCount': len(timestamps), 'start': timestamps[0], 'end': timestamps[-1],
             'expectedIntervalMs': expected, 'observedFps': round(1000 / expected, 3) if expected else None,
+            'cadenceToleranceMs': cadence_tolerance, 'cadenceDeviationCount': len(cadence_deviations), 'maxCadenceDeviationMs': max([item['deviation'] for item in cadence_deviations], default=0),
             'gapThresholdMs': threshold, 'gapCount': len(gaps), 'gapRatio': len(gaps) / max(1, len(deltas)),
             'maxGapMs': max([item['delta'] for item in gaps], default=0), 'gaps': gaps[:100],
         }

@@ -102,7 +102,7 @@ UMI 原始采集视频使用 `mpeg4`，浏览器不能稳定播放，平台会�
 
 ### 1. 获取源码并启动
 
-需要 Windows 10/11、Node.js 22.13+（推荐 Node.js 24 LTS） 和 PowerShell 5.1+。仓库不打包 Node / Python 运行时，首次使用请先安装所需环境。
+需要 Windows 10/11 和 Node.js 22.13+（推荐 Node.js 24 LTS）。仓库不打包 Node / Python 运行时，首次使用请先安装所需环境。平台日常启动与常驻运行不依赖 PowerShell。
 
 ```powershell
 git clone https://github.com/DDDB479/embodied-data-intelligence-processing-platform.git
@@ -112,7 +112,7 @@ node .\serve.js
 
 浏览器打开 [http://localhost:4173/](http://localhost:4173/)，首次启动创建自己的管理员账号。仓库没有可用于业务登录的默认账号或默认密码。
 
-日常使用可双击 `启动平台.bat`；启动器通过 `platform-service.ps1` 检查和维持本机服务。开机启动、局域网访问和故障定位见[操作说明](docs/OPERATIONS.md)。
+日常使用可双击 `启动平台.bat`；启动器通过隐藏的 Node 守护进程检查和维持本机服务，不会弹出 PowerShell 窗口。开机启动、局域网访问和故障定位见[操作说明](docs/OPERATIONS.md)。
 
 ### 从旧版本升级
 
@@ -239,9 +239,11 @@ UMI 质检会核对 RGB 帧数与视频解码帧数、相机/VIVE/夹爪采样�
 | **MCAP** | 每 Episode 一个 `.mcap`，写入原时间戳的 JSON 轨迹消息；视频随 ZIP 独立保留并由相对路径关联 | `embodied-json` profile；不是 ROS/ROS2 bag，不包含解码图像话题 |
 | **Zarr v2** | 每 Episode 一个 group；数值列为数组，其余列为带编码说明的 JSON 字符串；视频随包保留 | 本项目的列数组布局，接入训练框架时需核对字段与布局 |
 
-LeRobot v2.1 源包会物化为官方 v3.0；逐帧 HDF5 和 UMI Session 使用各自原生适配器直接创建官方 LeRobot v3.0。所有 LeRobot 交付只有在官方 LeRobot 0.4.4 Dataset 加载、视频帧解码、DataLoader batch 冒烟和独立解包验包全部通过后才可下载。MCAP / Zarr 从 LeRobot v2.1 工作目录生成，并通过全列回读、视频解码、ZIP CRC 和整包 SHA-256 校验；它们不是机器人策略训练格式的兼容性承诺。
+LeRobot v2.1 源包会物化为官方 v3.0；逐帧 HDF5 和 UMI Session 使用各自原生适配器直接创建官方 LeRobot v3.0。逐帧 HDF5 在导入时记录每个源文件的 SHA-256，质检时在读取同一份字节时重算并比对，转换后再从输出 Parquet 逐帧核对源数值。所有 LeRobot 交付只有在源数值一致性、官方 LeRobot 0.4.4 Dataset 加载、视频帧解码、DataLoader batch 冒烟和独立解包验包全部通过后才可下载。MCAP / Zarr 从 LeRobot v2.1 工作目录生成，并通过全列回读、视频解码、ZIP CRC 和整包 SHA-256 校验；它们不是机器人策略训练格式的兼容性承诺。
 
-同一批次的一份交付记录可以附加多种格式。源文件、任务指令或验收状态改变后，服务端阻止下载失效的转换包；源文件与基础快照不一致时，需要重新建立有效的交付版本。
+同一批次的一份交付记录可以附加多种格式。源文件、任务指令或验收状态改变后，服务端阻止下载失效的转换包；逐帧 HDF5 会重新核对 Episode 文件集合和逐文件 SHA-256，新增、缺失、重命名或内容变化都会要求重新建立交付版本。交付包中的 HDF5 源索引只记录 Episode 相对路径、帧相对路径和 SHA-256，不写部署电脑绝对路径。
+
+旧版本生成的逐帧 HDF5 清单没有逐文件 SHA-256，升级后质检或交付会明确要求重新导入该批次，不会继续沿用旧的 `size + mtime` 元数据指纹。
 
 ## 测试与证据
 
@@ -253,7 +255,7 @@ LeRobot v2.1 源包会物化为官方 v3.0；逐帧 HDF5 和 UMI Session 使用�
 | 官方加载、DataLoader、轨迹回读、缺视角 / 时间戳倒序拒绝 | [转换器测试](tests/test_delivery_convert.py)、[官方验证器](tools/official_lerobot.py) |
 | TeleUMI Session 聚合、时序质检、标注验收与 LeRobot v3.0 交付 | [UMI 导入测试](tests/umi-session-import.test.js)、[UMI 交付测试](tests/umi-session-delivery.test.js)、[UMI 转换器测试](tests/test_umi_convert.py) |
 
-2026-11-15 本地复核结果：**56 项 Node 测试 + 15 项 Python 测试通过**，官方 LeRobot 0.4.4 环境中的 UMI→v3.0 和 HDF5 四路预览测试通过；另用真实 5 条 UMI 数据完成 5 个 Episode、6,939 帧转换和独立 ZIP 验包。测试与结构验证不代表具体训练效果已经验收。
+2026-11-18 本地复核结果：**60 项 Node 测试 + 17 项 Python 测试通过**，常规 Python 环境中 2 项官方 LeRobot 交付测试按依赖条件跳过；官方 LeRobot 0.4.4 环境中的 HDF5→v3.0、源数值逐帧回读、路径脱敏和独立 ZIP 验包测试通过。测试与结构验证不代表具体训练效果已经验收。
 
 ```powershell
 node --check serve.js
@@ -298,8 +300,8 @@ node --test tests/*.test.js
 │   └── OPERATIONS.md               # 操作与部署说明
 ├── 更新平台.bat                    # 双击更新入口
 ├── update-platform.ps1              # 备份、快进更新、依赖同步与服务重启
-├── platform-launcher.ps1            # 启动与健康检查
-└── platform-service.ps1            # Windows 服务维持脚本
+├── platform-launcher.cjs           # 健康检查、隐藏启动与浏览器入口
+└── platform-service.cjs            # Node 常驻守护、故障重启与日志
 ```
 
 ## 参考与致谢

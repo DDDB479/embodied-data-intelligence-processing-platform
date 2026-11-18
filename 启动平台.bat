@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0platform-launcher.ps1" -OpenBrowser
-if errorlevel 1 pause
+wscript.exe //B //Nologo "%~dp0启动平台自动启动.vbs" open
+exit /b 0

@@ -51,13 +51,14 @@ test('server directory import aggregates HDF5 frame files into episodes', async 
     const setup = await request(port, 'POST', '/api/auth/setup', { name: 'QA', email: 'qa@example.invalid', password: 'TestPass12345' });
     assert.equal(setup.status, 201);
     const cookie = setup.headers['set-cookie'][0].split(';')[0];
-    const imported = await request(port, 'POST', '/api/imports/server-directory', { rootPath: fixture, bundleName: 'matching-cable', type: '遥操', preset: 'hdf5-sequence' }, cookie);
+    const imported = await request(port, 'POST', '/api/imports/server-directory', { rootPath: `"${fixture}"`, bundleName: 'matching-cable', type: '遥操', preset: 'hdf5-sequence' }, cookie);
     assert.equal(imported.status, 201, JSON.stringify(imported.body));
     assert.equal(imported.body.scan.episodeCount, 2);
     assert.equal(imported.body.scan.fileCount, 5);
     assert.equal(imported.body.assets.length, 2);
     assert.deepEqual(imported.body.assets.map(asset => asset.name), ['68', '69']);
     assert.ok(imported.body.assets.every(asset => asset.format === 'HDF5_SEQUENCE' && asset.serverFile.mode === 'external-hdf5-sequence'));
+    assert.ok(imported.body.assets.every(asset => asset.serverFile.provenanceVersion === 'content-sha256-v1' && /^[a-f0-9]{64}$/.test(asset.serverFile.sha256)));
     assert.equal(imported.body.bundle.episodeCount, 2);
     assert.equal(imported.body.bundle.episodeMediaPending, 0);
     assert.equal(imported.body.createdCount, 2);
@@ -69,6 +70,12 @@ test('server directory import aggregates HDF5 frame files into episodes', async 
     assert.equal(repeated.body.scan.episodeCount, 2);
     assert.deepEqual(repeated.body.assets.map(asset => asset.name), ['68', '69']);
     assert.equal(repeated.body.bundleId, imported.body.bundleId);
+    const changedFrame = path.join(source, '68', '0.hdf5'), frameStat = fs.statSync(changedFrame), originalBytes = fs.readFileSync(changedFrame);
+    fs.writeFileSync(changedFrame, Buffer.alloc(originalBytes.length, 90));
+    fs.utimesSync(changedFrame, frameStat.atime, frameStat.mtime);
+    const changed = await request(port, 'POST', '/api/imports/server-directory', { rootPath: source, bundleName: 'matching-cable', type: '遥操', preset: 'hdf5-sequence' }, cookie);
+    assert.equal(changed.status, 409, JSON.stringify(changed.body));
+    assert.match(changed.body.error, /内容哈希不一致/);
     const listed = await request(port, 'GET', '/api/assets', null, cookie);
     assert.equal(listed.status, 200);
     assert.equal(listed.body.assets.length, 2);

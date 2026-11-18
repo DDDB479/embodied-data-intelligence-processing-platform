@@ -89,7 +89,8 @@ function inspectSession(directory) {
 }
 
 function scanUmiRoot(input) {
-  const rootPath = path.resolve(String(input || '').trim()), rootStat = fs.statSync(rootPath, { throwIfNoEntry: false });
+  const normalized = String(input || '').trim().replace(/^["']|["']$/g, '').trim();
+  const rootPath = path.resolve(normalized), rootStat = fs.statSync(rootPath, { throwIfNoEntry: false });
   if (!rootStat?.isDirectory()) throw new Error('UMI server directory does not exist');
   const candidates = fs.statSync(path.join(rootPath, 'single_hand'), { throwIfNoEntry: false })?.isDirectory()
     ? [rootPath]

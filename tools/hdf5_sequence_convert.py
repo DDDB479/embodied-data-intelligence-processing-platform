@@ -133,6 +133,54 @@ def infer_fps(episodes):
     return fps, step
 
 
+NUMERIC_SOURCE_FIELDS = (
+    'observation.state', 'action', 'observation.eef', 'master.eef',
+    'observation.joint_effort', 'observation.force_torque', 'source.timestamp_ms',
+)
+
+
+def verify_numeric_consistency(output: Path, expectations: list[dict]) -> dict:
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    data_files = sorted((output / 'data').rglob('*.parquet'))
+    if not data_files:
+        raise ValueError('LeRobot 输出没有可供数值回读的 Parquet 文件')
+    expected = {(int(item['episode_index']), int(item['frame_index'])): item['values'] for item in expectations}
+    seen = set()
+    mismatches = []
+    for file in data_files:
+        table = pq.read_table(file, columns=['episode_index', 'frame_index', *NUMERIC_SOURCE_FIELDS]).to_pydict()
+        for index, (episode_index, frame_index) in enumerate(zip(table['episode_index'], table['frame_index'])):
+            key = (int(episode_index), int(frame_index))
+            source = expected.get(key)
+            if source is None:
+                mismatches.append({'episode_index': key[0], 'frame_index': key[1], 'field': 'row', 'message': '输出存在源清单之外的帧'})
+                continue
+            if key in seen:
+                mismatches.append({'episode_index': key[0], 'frame_index': key[1], 'field': 'row', 'message': '输出帧索引重复'})
+                continue
+            seen.add(key)
+            for field in NUMERIC_SOURCE_FIELDS:
+                actual = np.asarray(table[field][index], dtype=np.float32).reshape(-1)
+                wanted = np.asarray(source[field], dtype=np.float32).reshape(-1)
+                if actual.shape != wanted.shape or not np.allclose(actual, wanted, rtol=0, atol=1e-6):
+                    mismatches.append({
+                        'episode_index': key[0], 'frame_index': key[1], 'field': field,
+                        'message': '源值与输出 Parquet 不一致', 'actual': actual[:16].tolist(), 'expected': wanted[:16].tolist(),
+                    })
+                    if len(mismatches) >= 20:
+                        break
+        if len(mismatches) >= 20:
+            break
+    missing = len(expected) - len(seen)
+    if missing:
+        mismatches.append({'field': 'row', 'message': f'输出缺少 {missing} 个源帧'})
+    if mismatches:
+        raise ValueError(f'源数值与输出不一致：{json.dumps(mismatches[:20], ensure_ascii=False)}')
+    return {'checked': True, 'frameCount': len(expected), 'fields': list(NUMERIC_SOURCE_FIELDS), 'mismatches': 0}
+
+
 def build_dataset(manifest: dict, output: Path):
     import h5py
     import numpy as np
@@ -159,7 +207,7 @@ def build_dataset(manifest: dict, output: Path):
         video_backend='pyav', vcodec='h264', image_writer_processes=0,
         image_writer_threads=0, batch_encoding_size=1, streaming_encoding=True,
     )
-    episode_records, annotation_lines, source_records = [], [], []
+    episode_records, annotation_lines, source_records, numeric_expectations = [], [], [], []
     total_frames = sum(len(episode['files']) for episode in episodes)
     completed_frames = 0
     for output_index, episode in enumerate(episodes):
@@ -169,14 +217,19 @@ def build_dataset(manifest: dict, output: Path):
             file_path = Path(file_record['path'])
             if not file_path.is_file():
                 raise FileNotFoundError(f'HDF5 帧文件不存在：{file_path}')
-            with h5py.File(file_path, 'r') as handle:
+            source_bytes = file_path.read_bytes()
+            source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+            expected_sha256 = str(file_record.get('sha256') or '').strip()
+            if expected_sha256 and source_sha256 != expected_sha256:
+                raise ValueError(f'{file_path.name} 源 SHA-256 已变化，禁止使用旧交付清单')
+            with h5py.File(io.BytesIO(source_bytes), 'r') as handle:
                 source_ms = float(handle['timestamps'][0])
                 if not np.isfinite(source_ms) or source_ms < 0:
                     raise ValueError(f'{file_path.name} 时间戳无效')
                 if previous_ms is not None and source_ms <= previous_ms:
                     raise ValueError(f'{file_path.name} 时间戳未严格递增')
                 previous_ms = source_ms
-                frame = {
+                numeric_values = {
                     'task': instruction,
                     'observation.state': read_numeric(handle, STATE_FIELD, 16),
                     'action': read_numeric(handle, ACTION_FIELD, 16),
@@ -186,6 +239,8 @@ def build_dataset(manifest: dict, output: Path):
                     'observation.force_torque': read_numeric(handle, 'puppet/6f', 12),
                     'source.timestamp_ms': np.asarray([source_ms], dtype=np.float32),
                 }
+                numeric_expectations.append({ 'episode_index': output_index, 'frame_index': frame_index, 'values': {key: value for key, value in numeric_values.items() if key != 'task'} })
+                frame = numeric_values
                 for camera_index, camera_key in enumerate(CAMERAS):
                     raw = image_buffer(handle[f'observations/rgb_images/camera_{camera_index}'])
                     frame[camera_key] = decode_rgb(raw, camera_key, shapes[camera_key])
@@ -195,16 +250,22 @@ def build_dataset(manifest: dict, output: Path):
                         raise ValueError(f'{file_path.name} 缺少 /{field}')
                     validate_depth(image_buffer(handle[field]), depth_key)
                 dataset.add_frame(frame)
-            source_records.append({'episodeIndex': int(episode['episodeIndex']), 'frameIndex': frame_index, 'path': str(file_path)})
+            source_records.append({
+                'episodeIndex': int(episode['episodeIndex']), 'episodeRelativePath': str(episode.get('relativePath') or '').replace('\\', '/').strip('/'),
+                'frameIndex': frame_index, 'frameRelativePath': str(file_record.get('relativePath') or file_path.name).replace('\\', '/').strip('/'),
+                'sha256': source_sha256,
+            })
             completed_frames += 1
             if completed_frames % 50 == 0 or completed_frames == total_frames:
                 print('PROGRESS ' + json.dumps({'completed': completed_frames, 'total': total_frames, 'stage': 'encode'}), file=sys.stderr, flush=True)
         dataset.save_episode(parallel_encoding=False)
         episode_records.append({'episode_index': output_index, 'source_episode_index': int(episode['episodeIndex']), 'length': len(episode['files']), 'instruction': instruction})
         annotation_lines.append({'episode_index': output_index, 'instruction': instruction})
+    dataset.finalize()
     (output / 'annotations.jsonl').write_text(''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in annotation_lines), encoding='utf-8')
+    numeric_consistency = verify_numeric_consistency(output, numeric_expectations)
     (output / 'hdf5-source-index.json').write_text(json.dumps({'schemaVersion': 1, 'fps': fps, 'timestampStepMs': step_ms, 'episodes': episode_records, 'sourceFiles': source_records}, ensure_ascii=False, indent=2), encoding='utf-8')
-    return {'episodes': len(episode_records), 'frames': sum(item['length'] for item in episode_records), 'fps': fps, 'cameras': CAMERAS, 'annotations': annotation_lines}
+    return {'episodes': len(episode_records), 'frames': sum(item['length'] for item in episode_records), 'fps': fps, 'cameras': CAMERAS, 'annotations': annotation_lines, 'sourceNumericConsistency': numeric_consistency}
 
 
 def write_inventory(root: Path):

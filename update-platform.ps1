@@ -113,10 +113,11 @@ try {
         if ($response.StatusCode -eq 200 -and $response.Content -match "embodied-data-quality") { $healthy = $true; break }
       } catch {}
       if ($attempt -eq 8 -or $attempt -eq 20) {
-        $launcher = Join-Path $root "platform-launcher.ps1"
+        $launcher = Join-Path $root "platform-launcher.cjs"
         if (Test-Path -LiteralPath $launcher) {
-          $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-          Start-Process $powershell -WindowStyle Hidden -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $launcher) -WorkingDirectory $root
+          $node = Join-Path $root "runtime\node.exe"
+          if (-not (Test-Path -LiteralPath $node)) { $node = (Get-Command node.exe -ErrorAction Stop).Source }
+          Start-Process $node -WindowStyle Hidden -ArgumentList @($launcher, "--ensure") -WorkingDirectory $root
         }
       }
       Start-Sleep -Seconds 1

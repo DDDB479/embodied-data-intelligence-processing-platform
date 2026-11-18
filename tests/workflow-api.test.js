@@ -134,6 +134,15 @@ test('HTTP API rejects fabricated QC and completion state', async () => {
     assert.equal(task.status, 201);
     assert.equal(task.body.task.status, '待启动');
     assert.equal(task.body.task.acceptedBy, undefined);
+    const linkedTask = await request(port, 'POST', '/api/tasks', { id: 'TASK-QA-LINKED', name: '有关联资产的任务', scene: '测试', type: '遥操', targetCount: 1, acceptanceScore: 90 }, cookie);
+    assert.equal(linkedTask.status, 201);
+    assert.equal((await request(port, 'POST', '/api/assets', { id: 'AST-TASK-LINK', name: 'linked.bin', type: '遥操', taskId: 'TASK-QA-LINKED' }, cookie)).status, 201);
+    const blockedDelete = await request(port, 'DELETE', '/api/tasks/TASK-QA-LINKED', null, cookie);
+    assert.equal(blockedDelete.status, 409);
+    assert.match(blockedDelete.body.error, /已关联 1 个资产/);
+    const removedTask = await request(port, 'DELETE', '/api/tasks/TASK-QA-1', null, cookie);
+    assert.equal(removedTask.status, 200, JSON.stringify(removedTask.body));
+    assert.equal(removedTask.body.tasks.some(item => item.id === 'TASK-QA-1'), false);
   } finally {
     if (child.exitCode === null) {
       child.kill();

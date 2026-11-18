@@ -4,6 +4,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const zlib = require('node:zlib');
+const { Worker } = require('node:worker_threads');
 const { execFile, spawn, spawnSync } = require("child_process");
 const { promisify } = require("util");
 const { Transform } = require("stream");
@@ -47,6 +48,75 @@ function runCommandWithProgress(command, args, options = {}) {
 }
 
 const root = __dirname;
+let activeDirectoryScans = 0;
+function scanServerDirectory(kind, rootPath) {
+  if (activeDirectoryScans > 0) {
+    const error = new Error('已有服务端目录扫描正在执行，请等待完成后再试');
+    error.status = 409;
+    return Promise.reject(error);
+  }
+  activeDirectoryScans++;
+  const workerFile = path.join(root, 'tools', 'server-directory-scan-worker.cjs');
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(workerFile, { workerData: { kind, rootPath } });
+    let settled = false;
+    const finish = (error, scan) => {
+      if (settled) return;
+      settled = true;
+      activeDirectoryScans = Math.max(0, activeDirectoryScans - 1);
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(scan);
+    };
+    const timer = setTimeout(() => {
+      worker.terminate().catch(() => {});
+      finish(new Error('服务端目录扫描超过 30 分钟，已终止扫描'));
+    }, 30 * 60 * 1000);
+    worker.once('message', message => {
+      if (message?.ok) finish(null, message.scan);
+      else {
+        const error = new Error(message?.error?.message || '服务端目录扫描失败');
+        error.name = message?.error?.name || 'Error';
+        finish(error);
+      }
+    });
+    worker.once('error', error => finish(error));
+    worker.once('exit', code => {
+      if (!settled) finish(new Error(`服务端目录扫描线程异常退出：${code}`));
+    });
+  });
+}
+function prepareInspectionManifest(assets, uploadDir, manifestFile, settings, progress = () => {}) {
+  const workerFile = path.join(root, 'tools', 'inspection-manifest-worker.cjs');
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(workerFile, { workerData: { assets, uploadDir, manifestFile, settings } });
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(result);
+    };
+    const timer = setTimeout(() => {
+      worker.terminate().catch(() => {});
+      finish(new Error('质检清单准备超过 30 分钟，已终止扫描'));
+    }, 30 * 60 * 1000);
+    worker.on('message', message => {
+      if (message?.type === 'progress') {
+        progress({ completedAssets: Number(message.completed || 0), totalAssets: Number(message.total || 0), assetName: message.assetName || '' });
+      } else if (message?.type === 'result') {
+        finish(null, message.result);
+      } else if (message?.type === 'error') {
+        const error = new Error(message.error?.message || '质检清单准备失败');
+        error.name = message.error?.name || 'Error';
+        finish(error);
+      }
+    });
+    worker.once('error', error => finish(error));
+    worker.once('exit', code => {
+      if (!settled) finish(new Error(`质检清单准备线程异常退出：${code}`));
+    });
+  });
+}
 const { PlatformStore } = require(path.join(root, 'tools', 'platform-store.cjs'));
 const { TaskQueue } = require(path.join(root, 'tools', 'task-queue.cjs'));
 const backupTools = require(path.join(root, 'tools', 'storage-backup.cjs'));
@@ -350,9 +420,11 @@ async function createHdf5SequenceDelivery(state, jobId, bundleId, assetList, pro
   fs.mkdirSync(deliveryRoot, { recursive: true });
   const episodes = assetList.map(asset => {
     const sequence = hdf5Sequence.readSequenceManifest(path.join(uploadDir, asset.serverFile.storedName));
+    if (sequence.changed) throw new Error(`Episode ${episodeIndexForAsset(asset)} 的源文件集合或元数据已变化，请重新质检并建立新的交付版本`);
+    if (sequence.members.some(member => !/^[a-f0-9]{64}$/.test(String(member.sha256 || '')))) throw new Error(`Episode ${episodeIndexForAsset(asset)} 的旧清单缺少逐文件 SHA-256，请重新导入该批次`);
     const instruction = annotationInstructionForAsset(state, asset);
     if (!instruction) throw new Error(`Episode ${episodeIndexForAsset(asset)} 缺少已审核任务指令`);
-    return { episodeIndex: episodeIndexForAsset(asset), relativePath: asset.relativePath, instruction, files: sequence.members.map(member => ({ path: member.absolutePath, relativePath: member.relativePath })) };
+    return { episodeIndex: episodeIndexForAsset(asset), relativePath: asset.relativePath, instruction, files: sequence.members.map(member => ({ path: member.absolutePath, relativePath: member.relativePath, sha256: member.sha256 })) };
   }).sort((left, right) => left.episodeIndex - right.episodeIndex);
   fs.writeFileSync(requestPath, JSON.stringify({ repoId: `local/${String(bundleId).toLowerCase()}`, sourceProfile: 'hdf5-frame-sequence', episodes }, null, 2), 'utf8');
   try {
@@ -361,7 +433,7 @@ async function createHdf5SequenceDelivery(state, jobId, bundleId, assetList, pro
       onProgress: item => progress({ completed: Number(item.completed || 0), total: Number(item.total || 0), message: item.stage === 'verify' ? '正在执行官方 LeRobot 加载与 DataLoader 验证' : item.stage === 'package' ? '正在生成清单与交付 ZIP' : `正在编码 HDF5 帧 ${item.completed || 0}/${item.total || 0}` }),
     });
     const report = JSON.parse(String(stdout || '').trim());
-    if (report.ok !== true || report.officialVerification?.status !== 'passed' || report.officialVerification?.officialLerobotVersion !== OFFICIAL_LEROBOT_VERSION) throw new Error(report.error || 'HDF5 转 LeRobot v3.0 失败');
+    if (report.ok !== true || report.sourceNumericConsistency?.checked !== true || report.officialVerification?.status !== 'passed' || report.officialVerification?.officialLerobotVersion !== OFFICIAL_LEROBOT_VERSION) throw new Error(report.error || 'HDF5 转 LeRobot v3.0 失败或源数值回读一致性未通过');
     const { stdout: checked } = await execFileAsync(python, [path.join(root, 'tools', 'verify_delivery.py'), '--archive', archive, '--target', 'lerobot'], { timeout: 21600000, maxBuffer: 32 * 1024 * 1024, windowsHide: true });
     const verification = JSON.parse(String(checked || '').trim());
     if (verification.ok !== true || verification.officialVerification !== 'passed' || verification.archiveSha256 !== report.archiveSha256) throw new Error(verification.error || '独立验包失败');
@@ -582,7 +654,7 @@ function defaultRules() {
   ];
 }
 function defaultSettings() {
-  return { thresholds: { "快速质检": 85, "标准质检": 90, "全量质检": 93, "仅同步检测": 90 }, video: { minWidth: 640, minHeight: 480, blackMeanMax: 8, blackRatioMax: 0.95, freezeDifferenceMax: 0.15, freezeRatioMax: 0.98, durationToleranceSeconds: 0.1 }, hdf5: { gapAbsoluteMs: 100, gapFactor: 2.5, maxImagesPerDataset: 200, depthZeroRatioMax: 0.8 }, umi: { minCameraFps: 35, maxCameraFps: 45, minViveHz: 80, maxViveHz: 150, maxViveGapMs: 70, minClampHz: 50, maxClampHz: 70, maxClampGapMs: 50, maxStartOffsetMs: 100, maxEndOffsetMs: 100, minQuaternionNorm: 0.98, maxQuaternionNorm: 1.02, minClampValue: 0, maxClampValue: 100 }, issueWeights: { high: 35, medium: 8 } };
+  return { thresholds: { "快速质检": 85, "标准质检": 90, "全量质检": 93, "仅同步检测": 90 }, video: { minWidth: 640, minHeight: 480, blackMeanMax: 8, blackRatioMax: 0.95, freezeDifferenceMax: 0.15, freezeRatioMax: 0.98, durationToleranceSeconds: 0.1 }, hdf5: { gapAbsoluteMs: 100, gapFactor: 2.5, cadenceToleranceMs: 10, maxImagesPerDataset: 200, depthZeroRatioMax: 0.8 }, umi: { minCameraFps: 35, maxCameraFps: 45, minViveHz: 80, maxViveHz: 150, maxViveGapMs: 70, minClampHz: 50, maxClampHz: 70, maxClampGapMs: 50, maxStartOffsetMs: 100, maxEndOffsetMs: 100, minQuaternionNorm: 0.98, maxQuaternionNorm: 1.02, minClampValue: 0, maxClampValue: 100 }, issueWeights: { high: 35, medium: 8 } };
 }
 function defaultState() { return { assets: [], tasks: [], qcBatches: [], runs: [], audit: [], episodeTags: {}, issues: [], issueHistorySummary: { archivedCount: 0, lastCompactedAt: null }, annotations: [], annotationStandards: {}, annotationImports: [], exceptionReviews: [], exports: [], datasets: [], trainingJobs: [], feedbackSamples: [], nodes: [], members: [], bundles: [], notificationsReadAt: null, rules: defaultRules(), settings: defaultSettings() }; }
 function compactStateCollections(state) {
@@ -748,27 +820,18 @@ async function inspectProductionAssets(state, ids, progress = () => {}) {
   const manifest = path.join(workDir, `.inspection-${crypto.randomUUID()}.json`);
   const python = findLerobotPython();
   if (!python) throw new Error('未配置含 pyarrow 的 Python，无法执行生产质检；原问题保留。');
-  const sequenceByAsset = new Map(), umiByAsset = new Map();
-  const inspectionAssets = context.map(asset => {
-    if (isHdf5SequenceAsset(asset)) {
-      const sequence = hdf5Sequence.readSequenceManifest(path.join(uploadDir, asset.serverFile.storedName));
-      sequenceByAsset.set(asset.id, sequence);
-      return { id: asset.id, role: asset.bundleRole, bundleId: asset.bundleId, relativePath: asset.relativePath || asset.name, path: sequence.directory, members: sequence.members.map(member => ({ path: member.absolutePath, relativePath: member.relativePath })), sourceFingerprint: sequence.currentFingerprint, expectedFingerprint: asset.serverFile.sha256, sequenceProfile: sequence.profile };
-    }
-    if (isUmiSessionAsset(asset)) {
-      const session = umiData.readUmiManifest(path.join(uploadDir, asset.serverFile.storedName));
-      umiByAsset.set(asset.id, session);
-      return { id: asset.id, role: asset.bundleRole, bundleId: asset.bundleId, relativePath: asset.relativePath || asset.name, path: session.directory, sourceFingerprint: session.currentFingerprint, expectedFingerprint: asset.serverFile.sha256, umi: { profile: session.profile, sessionId: session.sessionId, taskName: session.taskName, qualityStatus: session.qualityStatus, canProcess: session.canProcess, captureStatus: session.captureStatus, required: session.required, files: session.members.map(member => ({ path: member.absolutePath, relativePath: member.sourceRelativePath, role: member.role, size: member.size })) } };
-    }
-    return { id: asset.id, role: asset.bundleRole, bundleId: asset.bundleId, relativePath: asset.relativePath || asset.name, path: path.join(uploadDir, asset.serverFile.storedName) };
-  });
-  fs.writeFileSync(manifest, JSON.stringify({ assets: inspectionAssets, settings: { ...state.settings.video, hdf5: state.settings.hdf5 || {} } }));
-  const selectedFrames = selected.reduce((sum, asset) => sum + (isHdf5SequenceAsset(asset) || isUmiSessionAsset(asset) ? Number(asset.frameCount || asset.serverFile?.fileCount || 0) : 1), 0);
-  const frameTotals = new Map(inspectionAssets.map(asset => [asset.id, Number(asset.umi ? selected.find(item => item.id === asset.id)?.frameCount || 1 : asset.members?.length || 1)])), priorFrames = new Map();
-  let cumulativeFrames = 0;
-  for (const asset of inspectionAssets) { priorFrames.set(asset.id, cumulativeFrames); cumulativeFrames += frameTotals.get(asset.id); }
-  progress({ completed: 0, total: selectedFrames, message: `正在逐帧解码和解析 ${selected.length} 个 Episode / ${selectedFrames} 帧` });
   try {
+    const inspectionContext = context.map(asset => ({ id: asset.id, name: asset.name, format: asset.format, bundleRole: asset.bundleRole, bundleId: asset.bundleId, relativePath: asset.relativePath, frameCount: asset.frameCount, serverFile: { storedName: asset.serverFile?.storedName, mode: asset.serverFile?.mode, fileCount: asset.serverFile?.fileCount, sha256: asset.serverFile?.sha256 } }));
+    const estimatedFrames = selected.reduce((sum, asset) => sum + (isHdf5SequenceAsset(asset) || isUmiSessionAsset(asset) ? Number(asset.frameCount || asset.serverFile?.fileCount || 0) : 1), 0);
+    progress({ completed: 0, total: estimatedFrames, message: `正在读取 ${context.length} 个 Episode 的源文件清单` });
+    const prepared = await prepareInspectionManifest(inspectionContext, uploadDir, manifest, { ...state.settings.video, hdf5: state.settings.hdf5 || {} }, item => {
+      progress({ completed: 0, total: estimatedFrames, message: `正在读取源文件清单 ${Number(item.completedAssets || 0)}/${Number(item.totalAssets || 0)} 个 Episode${item.assetName ? ` · ${item.assetName}` : ''}` });
+    });
+    const frameById = new Map(prepared.frames.map(item => [item.id, Number(item.count || 1)])), selectedFrames = selected.reduce((sum, asset) => sum + Number(frameById.get(asset.id) || 1), 0);
+    const frameTotals = new Map(prepared.frames.map(item => [item.id, Number(item.count || 1)])), priorFrames = new Map();
+    let cumulativeFrames = 0;
+    for (const frame of prepared.frames) { priorFrames.set(frame.id, cumulativeFrames); cumulativeFrames += Number(frame.count || 1); }
+    progress({ completed: 0, total: selectedFrames, message: `源文件清单已完成，开始逐帧解码和解析 ${selected.length} 个 Episode / ${selectedFrames} 帧` });
     const { stdout } = await runCommandWithProgress(python, [path.join(root, 'tools', 'production_check.py'), '--manifest', manifest], {
       timeout: 1800000, maxBuffer: 32 * 1024 * 1024,
       onProgress: item => {
@@ -784,8 +847,8 @@ async function inspectProductionAssets(state, ids, progress = () => {}) {
       if (!asset) continue;
       const checkedAt = new Date().toISOString();
       const mediaReview = asset.inspection?.production?.mediaReview;
-      const sequence = sequenceByAsset.get(asset.id), umi = umiByAsset.get(asset.id);
-      const actualHash = sequence ? sequence.currentFingerprint : umi ? umi.currentFingerprint : await backupTools.digest(path.join(uploadDir, asset.serverFile.storedName));
+      const preparedFingerprint = prepared.fingerprints[asset.id];
+      const actualHash = preparedFingerprint || await backupTools.digest(path.join(uploadDir, asset.serverFile.storedName));
       asset.inspection = { ...(asset.inspection || {}), production: { ...result, ...(actualHash !== asset.serverFile.sha256 ? {error:'源文件指纹已变化，请恢复原文件或重新导入该 Episode'} : {}), checkedAt, sha256: asset.serverFile.sha256, sourceFingerprint: actualHash, ...(mediaReview?.sha256 === actualHash ? { mediaReview } : {}) } };
       if (result.schema) asset.inspection.lerobotSchema = { ...result.schema, checkedAt, parser: 'pyarrow' };
       if (result.schema) asset.serverFile.deepCheck = { status: 'verified', detail: '已由 PyArrow 读取 Parquet 容器与内部列', checkedAt };
@@ -860,7 +923,7 @@ function permissionFor(req, pathname) {
     [/^\/api\/episodes\/preview$/, ['资产查看', '运行质检', '资产管理']],
     [/^\/api\/episodes\/[^/]+\/preview$/, ['资产管理']],
     [/^\/api\/imports\/(?:rollback|analyze|server-directory)$/, ["资产上传", "资产管理"]],
-    [/^\/api\/assets\/lerobot-deep-check$/, ["运行质检", "资产管理"]], [/^\/api\/assets\/bulk-delete$/, ["删除数据"]], [/^\/api\/assets\/[^/]+$/, ["删除数据"]], [/^\/api\/assets$/, ["资产上传", "资产管理"]], [/^\/api\/tasks(?:\/status)?$/, ["采集任务"]],
+    [/^\/api\/assets\/lerobot-deep-check$/, ["运行质检", "资产管理"]], [/^\/api\/assets\/bulk-delete$/, ["删除数据"]], [/^\/api\/assets\/[^/]+$/, ["删除数据"]], [/^\/api\/assets$/, ["资产上传", "资产管理"]], [/^\/api\/tasks(?:\/status|\/[^/]+)?$/, ["采集任务"]],
     [/^\/api\/annotations\//, ["标注编辑", "标注审核", "资产管理"]], [/^\/api\/exports(?:\/(?:convert|verify))?$/, ["数据集发布"]],
     [/^\/api\/datasets(?:\/status)?$/, ["数据集发布"]], [/^\/api\/training\/feedback$/, ["失败样本回流", "训练调度"]],
     [/^\/api\/training(?:\/status)?$/, ["训练调度"]], [/^\/api\/nodes/, ["节点管理"]],
@@ -2339,12 +2402,18 @@ function isLogicalEpisodeAsset(asset) {
   return asset?.bundleRole === 'trajectory' && (/episode_\d+\.parquet$/i.test(asset.relativePath || asset.name || '') || isHdf5SequenceAsset(asset) || isUmiSessionAsset(asset));
 }
 
-function registerHdf5SequenceDirectory(state, body, user) {
-  const scan = hdf5Sequence.scanHdf5SequenceRoot(body.rootPath);
+function registerHdf5SequenceDirectory(state, body, user, preparedScan = null) {
+  const scan = preparedScan || hdf5Sequence.scanHdf5SequenceRoot(body.rootPath);
   if (scan.episodeCount > 10000) throw new Error(`目录内聚合出 ${scan.episodeCount} 个 Episode，超过单批 10000 个限制`);
   const existingByDirectory = new Map(state.assets.filter(asset => asset.serverFile?.mode === 'external-hdf5-sequence').map(asset => [path.resolve(asset.sourceDirectory || '').toLowerCase(), asset]));
   const existingEpisodes = scan.episodes.map(episode => ({ episode, asset: existingByDirectory.get(path.resolve(episode.directory).toLowerCase()) })).filter(item => item.asset);
   if (existingEpisodes.length === scan.episodes.length) {
+    const changed = existingEpisodes.filter(item => item.asset.serverFile?.provenanceVersion !== 'content-sha256-v1' || item.asset.serverFile?.sha256 !== item.episode.fingerprints);
+    if (changed.length) {
+      const error = new Error(`目录已有 ${changed.length} 个 Episode 与当前内容哈希不一致或来自旧版元数据指纹。请删除未验收批次后重新导入；已验收批次应建立修订批次。`);
+      error.status = 409;
+      throw error;
+    }
     const bundleIds = [...new Set(existingEpisodes.map(item => item.asset.bundleId).filter(Boolean))], bundleId = bundleIds.length === 1 ? bundleIds[0] : existingEpisodes[0].asset.bundleId;
     const bundle = state.bundles.find(item => item.id === bundleId);
     return { bundleId, bundleName: bundle?.name || existingEpisodes[0].asset.bundleName || scan.rootName, scan, assets: existingEpisodes.map(item => item.asset), createdCount: 0, existingCount: existingEpisodes.length };
@@ -2374,7 +2443,7 @@ function registerHdf5SequenceDirectory(state, body, user) {
       episodeIndex: episode.episodeIndex, frameCount: episode.fileCount, firstSourceFile: episode.firstFile, lastSourceFile: episode.lastFile,
       serverFile: {
         mode: 'external-hdf5-sequence', storedName: manifestName, sourceRoot: scan.rootPath, sourceDirectory: episode.directory,
-        originalName: episode.name, sha256: episode.fingerprints, size: episode.totalBytes, fileCount: episode.fileCount,
+        originalName: episode.name, sha256: episode.fingerprints, provenanceVersion: 'content-sha256-v1', size: episode.totalBytes, fileCount: episode.fileCount,
         sequenceProfile: scan.profile, storedAt: now, uploadMode: 'server-directory-reference',
         contentCheck: { valid: true, extension: 'HDF5_SEQUENCE', detail: `已登记 ${episode.fileCount} 个 HDF5 帧文件`, recordCount: episode.fileCount },
       },
@@ -2393,8 +2462,8 @@ function registerHdf5SequenceDirectory(state, body, user) {
   }
 }
 
-function registerUmiSessionDirectory(state, body, user) {
-  const scan = umiData.scanUmiRoot(body.rootPath);
+function registerUmiSessionDirectory(state, body, user, preparedScan = null) {
+  const scan = preparedScan || umiData.scanUmiRoot(body.rootPath);
   if (scan.sessionCount > 10000) throw new Error(`UMI directory contains ${scan.sessionCount} sessions; the batch limit is 10000`);
   const existingByDirectory = new Map(state.assets.filter(asset => asset.serverFile?.mode === 'external-umi-session').map(asset => [path.resolve(asset.sourceDirectory || '').toLowerCase(), asset]));
   const existingSessions = scan.sessions.map(session => ({ session, asset: existingByDirectory.get(path.resolve(session.directory).toLowerCase()) })).filter(item => item.asset);
@@ -2891,6 +2960,21 @@ async function handleApi(req, res, pathname, url) {
     } catch (error) { sendError(res, error.status || 400, error.message || "资产删除失败", error.extra); }
     return true;
   }
+  const deleteTaskRoute = /^\/api\/tasks\/([^/]+)$/.exec(pathname);
+  if (req.method === "DELETE" && deleteTaskRoute) {
+    try {
+      const id = decodeURIComponent(deleteTaskRoute[1]), task = state.tasks.find(item => item.id === id);
+      if (!task) { const error = new Error("采集任务不存在或已删除"); error.status = 404; throw error; }
+      assertTypeAllowed(currentUser, task.type);
+      const linked = state.assets.filter(item => !item.isDemo && item.taskId === id);
+      if (linked.length) { const error = new Error(`采集任务已关联 ${linked.length} 个资产，不能只删除任务记录；请先在数据资产中处理这些资产`); error.status = 409; throw error; }
+      state.tasks = state.tasks.filter(item => item.id !== id);
+      audit(state, "删除采集任务", id, `${task.name} · ${task.type}`, currentUser.name);
+      writeState(state);
+      sendJson(res, 200, { ok: true, removed: id, tasks: state.tasks.filter(item => typeAllowed(currentUser, item.type)).map(item => enrichTask(state, item)) });
+    } catch (error) { sendError(res, error.status || 400, error.message || "采集任务删除失败", error.extra); }
+    return true;
+  }
   const contentRoute = /^\/api\/assets\/([^/]+)\/content$/.exec(pathname);
   if (req.method === "PUT" && contentRoute) {
     try { const id = decodeURIComponent(contentRoute[1]), existing = state.assets.find(item => item.id === id); if (!existing) { const error = new Error("资产不存在，请先创建资产元数据"); error.status = 404; throw error; } assertTypeAllowed(currentUser, existing.type); const originalName = decodeURIComponent(req.headers["x-file-name"] || url.searchParams.get("filename") || "upload.bin"); const asset = await streamAssetContent(req, id, originalName); sendJson(res, 201, { ok: true, asset }); }
@@ -3021,15 +3105,21 @@ async function handleApi(req, res, pathname, url) {
     if (pathname === "/api/imports/server-directory") {
       const requested = String(body.preset || 'auto').trim();
       if (!['auto', 'umi-session', 'hdf5-sequence'].includes(requested)) throw new Error('服务端目录导入只支持自动识别、UMI Session 或 HDF5 帧序列');
+      const rootPath = String(body.rootPath || '').trim();
+      if (!rootPath) throw new Error('服务端目录路径不能为空');
       let mode = requested === 'hdf5-sequence' && String(body.type || '').trim() === 'UMI' ? 'umi-session' : requested;
+      let preparedScan = null;
       if (mode === 'auto') {
-        try { umiData.scanUmiRoot(body.rootPath); mode = 'umi-session'; }
+        try { preparedScan = await scanServerDirectory('umi-session', rootPath); mode = 'umi-session'; }
         catch (error) {
           if (error.message === 'No UMI session directories found') mode = 'hdf5-sequence';
           else throw error;
         }
       }
-      const result = mode === 'umi-session' ? registerUmiSessionDirectory(state, { ...body, type: 'UMI' }, currentUser) : registerHdf5SequenceDirectory(state, body, currentUser);
+      if (!preparedScan) preparedScan = await scanServerDirectory(mode, rootPath);
+      const result = mode === 'umi-session'
+        ? registerUmiSessionDirectory(state, { ...body, rootPath, type: 'UMI' }, currentUser, preparedScan)
+        : registerHdf5SequenceDirectory(state, { ...body, rootPath }, currentUser, preparedScan);
       const scan = mode === 'umi-session'
         ? { mode, rootPath: result.scan.rootPath, rootName: result.scan.rootName, episodeCount: result.scan.episodeCount, sessionCount: result.scan.sessionCount, fileCount: result.scan.fileCount, totalBytes: result.scan.totalBytes, frameCount: result.scan.frameCount, sessions: result.scan.sessions.map(session => ({ name: session.name, frameCount: session.frameCount, taskName: session.taskName })) }
         : { mode, rootPath: result.scan.rootPath, rootName: result.scan.rootName, episodeCount: result.scan.episodeCount, fileCount: result.scan.fileCount, totalBytes: result.scan.totalBytes };
@@ -3480,7 +3570,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === "/health") {
     ensureStorage();
     const summary = healthStateSummary || summarizeStateForHealth(readState()), auth = readAuth(), embodiedPlugin = findEmbodiedInvocation(), officialLerobot = inspectOfficialLerobotRuntime();
-    sendJson(res, 200, { ok: true, service: "embodied-data-quality", version: SERVICE_VERSION, port, storage: "sqlite-wal", uploadMode: "resumable-chunks", importRollback: "resume-preserving-uploaded-files", backgroundTasks: "durable-single-worker", storageReconcile: "enabled", qcEngine: "evidence-v3-embodied", embodiedPlugin: embodiedPlugin ? "available" : "missing", annotationUnit: "episode-auto-import-or-task-manual", annotationAutoImport: "annotations-jsonl-and-lerobot-metadata", importPresetDetection: "auto-with-manual-override", ingestionPolicy: "preset-specific-required-groups", hdf5ImportMode: "server-directory-episode-aggregation", hdf5SequencePreset: "matching-cable-frames-folder-as-episode", episodePreview: "on-demand-four-camera-h264-cache", previewConcurrency: 1, previewMaxWidth: 640, previewCache: "work/previews/asset/fingerprint", qcPolicy: "after-all-registered-originals-uploaded", assetDeleteScopes: "selection-bundle-folder", pipelineProgress: "upload-clean-qc-preview-annotation-conversion", stateCompaction: "closed-issues-and-qc-result-samples", uploadSessionRetention: 100, assetPageSize: 300, deliveryUnit: "episode-with-views", deliveryFormat: TRAINING_DELIVERY_FORMAT, deliveryFormats: [TRAINING_DELIVERY_FORMAT, "MCAP JSON + original videos", "Zarr v2"], deliveryConversion: "hdf5-sequence-native-or-official-lerobot-v3-loaded-and-dataloader-verified", officialLerobotRuntime: officialLerobot.status, officialLerobotVersion: officialLerobot.version, officialLerobotExpectedVersion: officialLerobot.expectedVersion, officialLerobotVerificationRequired: true, manifestPolicy: "one-per-batch", pipelineTemplate: "V6", pipelineV5Enabled: false, pipelineNodes: V6_WORKFLOW_GROUPS.reduce((sum, group) => sum + group.nodes.length, 0), engineOperators: engineOperatorCatalog(embodiedPlugin).map(item => ({ id: item.id, status: item.status })), workflowStages: WORKFLOW_STAGES.map(item => item.id), issueClosure: "server-evidence-required", productionWorkflow: "task-asset-acceptance", authMode: "local", accessControl: "role-domain-and-owner-grants", setupRequired: auth.users.length === 0, accounts: auth.users.length, ...summary });
+    sendJson(res, 200, { ok: true, service: "embodied-data-quality", version: SERVICE_VERSION, port, storage: "sqlite-wal", uploadMode: "resumable-chunks", importRollback: "resume-preserving-uploaded-files", serverDirectoryScan: "worker-thread", qualityManifestScan: "worker-thread", backgroundTasks: "durable-single-worker", storageReconcile: "enabled", qcEngine: "evidence-v3-embodied", embodiedPlugin: embodiedPlugin ? "available" : "missing", annotationUnit: "episode-auto-import-or-task-manual", annotationAutoImport: "annotations-jsonl-and-lerobot-metadata", importPresetDetection: "auto-with-manual-override", ingestionPolicy: "preset-specific-required-groups", hdf5ImportMode: "server-directory-episode-aggregation", hdf5SequencePreset: "matching-cable-frames-folder-as-episode", episodePreview: "on-demand-four-camera-h264-cache", previewConcurrency: 1, previewMaxWidth: 640, previewCache: "work/previews/asset/fingerprint", qcPolicy: "after-all-registered-originals-uploaded", assetDeleteScopes: "selection-bundle-folder", pipelineProgress: "upload-clean-qc-preview-annotation-conversion", stateCompaction: "closed-issues-and-qc-result-samples", uploadSessionRetention: 100, assetPageSize: 300, deliveryUnit: "episode-with-views", deliveryFormat: TRAINING_DELIVERY_FORMAT, deliveryFormats: [TRAINING_DELIVERY_FORMAT, "MCAP JSON + original videos", "Zarr v2"], deliveryConversion: "hdf5-sequence-native-or-official-lerobot-v3-loaded-and-dataloader-verified", officialLerobotRuntime: officialLerobot.status, officialLerobotVersion: officialLerobot.version, officialLerobotExpectedVersion: officialLerobot.expectedVersion, officialLerobotVerificationRequired: true, manifestPolicy: "one-per-batch", pipelineTemplate: "V6", pipelineV5Enabled: false, pipelineNodes: V6_WORKFLOW_GROUPS.reduce((sum, group) => sum + group.nodes.length, 0), engineOperators: engineOperatorCatalog(embodiedPlugin).map(item => ({ id: item.id, status: item.status })), workflowStages: WORKFLOW_STAGES.map(item => item.id), issueClosure: "server-evidence-required", productionWorkflow: "task-asset-acceptance", authMode: "local", accessControl: "role-domain-and-owner-grants", setupRequired: auth.users.length === 0, accounts: auth.users.length, ...summary });
     return;
   }
   if (await handleApi(req, res, pathname, url)) return;

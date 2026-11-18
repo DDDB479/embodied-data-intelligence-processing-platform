@@ -67,7 +67,7 @@ test('server directory import aggregates UMI sessions and remains idempotent', a
     const setup = await request(port, 'POST', '/api/auth/setup', { name: 'QA', email: 'umi@example.invalid', password: 'TestPass12345' });
     assert.equal(setup.status, 201);
     const cookie = setup.headers['set-cookie'][0].split(';')[0];
-    const imported = await request(port, 'POST', '/api/imports/server-directory', { rootPath: source, bundleName: 'umi-test', type: '遥操', preset: 'auto' }, cookie);
+    const imported = await request(port, 'POST', '/api/imports/server-directory', { rootPath: `"${source}"`, bundleName: 'umi-test', type: '遥操', preset: 'auto' }, cookie);
     assert.equal(imported.status, 201, JSON.stringify(imported.body));
     assert.equal(imported.body.scan.mode, 'umi-session');
     assert.equal(imported.body.scan.sessionCount, 2);

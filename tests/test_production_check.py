@@ -1,4 +1,5 @@
 import json
+import hashlib
 import io
 from pathlib import Path
 import sys
@@ -138,16 +139,42 @@ class ProductionChecks(unittest.TestCase):
             session = root / '68'
             session.mkdir()
             paths = [write_hdf5_episode(session, f'{index}.hdf5', timestamp, rgb, depth) for index, timestamp in enumerate([0, 50, 400])]
-            report = inspect({'assets': [{'id': 'sequence', 'bundleId': 'B', 'relativePath': '68', 'path': str(session), 'role': 'trajectory', 'members': [{'relativePath': path.name, 'path': str(path)} for path in paths]}], 'settings': {'hdf5': {'gapAbsoluteMs': 100, 'minWidth': 640, 'minHeight': 480}}})
+            members = [{'relativePath': path.name, 'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()} for path in paths]
+            report = inspect({'assets': [{'id': 'sequence', 'bundleId': 'B', 'relativePath': '68', 'path': str(session), 'role': 'trajectory', 'members': members}], 'settings': {'hdf5': {'gapAbsoluteMs': 100, 'minWidth': 640, 'minHeight': 480}}})
             result = report['files'][0]
             self.assertEqual(result['hdf5']['profile'], 'matching_cable_frames_v1')
-            self.assertEqual(result['hdf5']['status'], 'warning')
+            self.assertEqual(result['hdf5']['status'], 'invalid')
             self.assertEqual(result['hdf5']['metrics']['sampleCount'], 3)
             self.assertEqual(result['hdf5']['metrics']['rgbDecodedImages'], 12)
             self.assertEqual(result['hdf5']['metrics']['depthDecodedImages'], 6)
             self.assertEqual(result['hdf5']['sequence']['gapCount'], 1)
             self.assertEqual(result['structure']['recordCount'], 3)
             json.dumps(report, allow_nan=False)
+
+    def test_hdf5_source_hash_mismatch_is_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rgb = encoded_image(root, 'frame.jpg', 'mjpeg', 'yuvj420p', 'rgb24')
+            depth = encoded_image(root, 'depth.png', 'png', 'gray', 'gray')
+            path = write_hdf5_episode(root, 'frame.hdf5', 0, rgb, depth)
+            result = check_hdf5(path, {}, '0' * 64)
+            self.assertEqual(result['status'], 'invalid')
+            self.assertTrue(any(item['code'] == 'source_sha256' for item in result['issues']))
+
+    def test_hdf5_timestamp_reversal_and_cadence_drift_are_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rgb = encoded_image(root, 'frame.jpg', 'mjpeg', 'yuvj420p', 'rgb24')
+            depth = encoded_image(root, 'depth.png', 'png', 'gray', 'gray')
+            session = root / '68'
+            session.mkdir()
+            paths = [write_hdf5_episode(session, f'{index}.hdf5', timestamp, rgb, depth) for index, timestamp in enumerate([0, 50, 40, 111])]
+            members = [{'relativePath': path.name, 'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()} for path in paths]
+            report = inspect({'assets': [{'id': 'sequence', 'bundleId': 'B', 'relativePath': '68', 'path': str(session), 'role': 'trajectory', 'members': members}], 'settings': {'hdf5': {'gapAbsoluteMs': 100, 'cadenceToleranceMs': 10, 'minWidth': 640, 'minHeight': 480}}})
+            item = report['files'][0]['hdf5']
+            self.assertEqual(item['status'], 'invalid')
+            self.assertTrue(any(issue['code'] == 'timestamp_order' for issue in item['issues']))
+            self.assertGreater(item['sequence']['cadenceDeviationCount'], 0)
 
     def test_unknown_hdf5_profile_is_capability_blocked_not_invalid(self):
         with tempfile.TemporaryDirectory() as directory:

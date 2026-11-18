@@ -6,7 +6,6 @@
 
 - Windows 10/11
 - Node.js 22.13 或更高版本（推荐 24 LTS）
-- PowerShell 5.1 或更高版本
 - LeRobot/Parquet 深度校验需要 Python 3.12 和 `pyarrow`
 - LeRobot v3.0 训练交付需要独立锁定的 LeRobot 0.4.4、Torch 2.7.1 CPU、PyAV 和 datasets 运行时
 
@@ -18,7 +17,9 @@ node .\serve.js
 
 浏览器访问 `http://localhost:4173/`。
 
-Windows 上也可以运行 `启动平台.bat`。该启动器会检查健康状态，并通过计划任务维持服务。若需要局域网访问，使用 `开启局域网访问.bat` 后，从同一网络的其他电脑访问本机局域网 IP 的 4173 端口。
+Windows 上也可以运行 `启动平台.bat`。该入口只调用 `wscript.exe` 和项目自带的 Node 运行时，由 `platform-launcher.cjs` 检查健康状态，并由 `platform-service.cjs` 常驻监视、自动重启服务；日常启动和服务运行不需要 PowerShell，也不会打开 PowerShell 窗口。计划任务直接执行同一隐藏启动入口。若需要局域网访问，使用 `开启局域网访问.bat` 后，从同一网络的其他电脑访问本机局域网 IP 的 4173 端口。
+
+服务守护日志位于 `work\supervisor.log`，启动入口日志位于 `work\launcher.log`。服务进程异常退出时会自动重新启动；后台维护时应先停用两个平台计划任务，再结束 `platform-service.cjs` 和服务进程，避免看门狗再次拉起服务。
 
 ## 数据与安全
 
@@ -29,6 +30,8 @@ Windows 上也可以运行 `启动平台.bat`。该启动器会检查健康状�
 浏览器导入最多同时上传 3 个文件。每个文件默认按 16 MiB 分片；活动会话的进度和分片摘要保存在 `work/upload-sessions/` 的独立清单中，不会在每个分片后同步重写全部上传记录。服务重启后沿用最后一次检查点，未提交的文件尾部会被截断并重传。分片完成时会完整复核摘要、计算整文件 SHA-256 并直接重命名到原始文件目录。
 
 逐帧 HDF5 不应走浏览器逐文件上传。超过 200 个纯 `.h5/.hdf5` 文件时，平台会阻止批量登记并提示使用“服务端目录导入”。该入口扫描部署电脑上的目录，把每个包含 HDF5 帧文件的子目录聚合为一个 Episode，只写入小型序列清单，源文件保留原位。以 `matching_cable/68` 到 `74` 为例，11,879 个帧文件会登记为 7 个 Episode，而不是 11,879 个资产。
+
+大目录扫描在独立 Node Worker 线程中执行，不阻塞主 HTTP 服务和 `/health` 检查；同一时间只允许一个服务端目录扫描，重复提交会提示等待当前任务完成。
 
 ### Episode 预览缓存
 
@@ -46,9 +49,11 @@ HDF5 Episode 的四路预览在首次打开时按需生成，也可在 Episode �
 
 平台区分“数据缺陷”和“质检能力限制”。文件不存在、摘要变化、结构错误、非有限数值、图像无法解码、时间缺口等属于可定位的数据问题；“解析器不支持”或“缺少必要标定元数据”属于质检阻塞或限制，不得用伪造分数代替。
 
-遥操 HDF5 当前支持 `teleop-hdf5-v1` 和 `matching_cable_frames_v1` 结构：检查时间戳、主从关节/末端位姿、力通道、4 路 RGB、2 路深度图像，并按同一目录内全部帧推断 FPS、重复时间戳和缺口。服务端目录导入会把整个帧目录作为一个 Episode 流式检查。`puppet/6f` 为可选通道，缺失或恒零会记录为未启用限制，不生成数据缺陷。缺少关节单位、相机内参/外参时仍会记录结果，但物理量语义和跨模态标定保持为未验证。
+遥操 HDF5 当前支持 `teleop-hdf5-v1` 和 `matching_cable_frames_v1` 结构：检查时间戳、主从关节/末端位姿、力通道、4 路 RGB、2 路深度图像，并按同一目录内全部帧推断 FPS、非递增时间戳、间隔偏差和缺口。服务端目录导入会把整个帧目录作为一个 Episode，并为每个 HDF5 记录真实 SHA-256；质检读取源字节时重算哈希并比对。`puppet/6f` 为可选通道，缺失或恒零会记录为未启用限制，不生成数据缺陷。缺少关节单位、相机内参/外参时仍会记录结果，但物理量语义和跨模态标定保持为未验证。
 
-`matching_cable_frames_v1` 转换为官方 LeRobot v3.0 时，`master/joint_position` 写入 `action`，`puppet/joint_position` 写入 `observation.state`；`puppet/eef`、`master/eef`、关节力矩和六维力作为附加数值字段。四路 RGB 转为视频，两路深度图验证可读后保留在原始 HDF5 中。转换完成后继续执行官方 Dataset、首中末帧和 DataLoader 验包。
+逐帧 HDF5 的 Episode 文件集合会按当前目录重新核对。新增、缺失、重命名、大小或修改时间变化会阻止质检或交付；内容变化但大小和修改时间不变时，由逐文件 SHA-256 比对阻断。旧版本生成且没有逐文件 SHA-256 的清单必须重新导入，不能继续沿用元数据指纹。
+
+`matching_cable_frames_v1` 转换为官方 LeRobot v3.0 时，`master/joint_position` 写入 `action`，`puppet/joint_position` 写入 `observation.state`；`puppet/eef`、`master/eef`、关节力矩和六维力作为附加数值字段。四路 RGB 转为视频，两路深度图验证可读后保留在原始 HDF5 中。转换完成后重新读取输出 Parquet，逐帧核对源数值，再执行官方 Dataset、首中末帧和 DataLoader 验包。交付索引不包含本机绝对路径。
 
 运行环境需要 `h5py`、`av`、`numpy`、`pyarrow`。生产质检会实际解码图像和视频，数据集越大耗时越长；建议按批次执行，不要对已完成且文件未变化的批次反复全量扫描。
 
